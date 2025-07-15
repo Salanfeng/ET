@@ -89,7 +89,7 @@ if [ "$BUILD_AARCH64" = true ]; then
         -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
         -DANDROID_ABI='arm64-v8a' \
         -DEXECUTORCH_BUILD_KERNELS_QUANTIZED=ON \
-        -DANDROID_PLATFORM=android-30 \
+        -DANDROID_PLATFORM=android-35 \
         -DPYTHON_EXECUTABLE=$PYTHON_EXECUTABLE \
         -B$BUILD_ROOT
 
@@ -102,7 +102,7 @@ if [ "$BUILD_AARCH64" = true ]; then
         -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake \
         -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
         -DANDROID_ABI='arm64-v8a' \
-        -DANDROID_PLATFORM=android-30 \
+        -DANDROID_PLATFORM=android-35 \
         -DCMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH \
         -DEXECUTORCH_BUILD_KERNELS_QUANTIZED=ON \
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
@@ -112,52 +112,3 @@ if [ "$BUILD_AARCH64" = true ]; then
     cmake --build $EXAMPLE_ROOT -j$BUILD_JOB_NUMBER
 fi
 
-if [ "$BUILD_X86_64" = true ]; then
-    BUILD_ROOT=$PRJ_ROOT/$CMAKE_X86_64
-    if [ "$CLEAN" = true ]; then
-        rm -rf $BUILD_ROOT && mkdir $BUILD_ROOT
-    else
-        # Force rebuild flatccrt for the correct platform
-        cd $BUILD_ROOT/third-party/flatcc && make clean
-    fi
-
-    cd $BUILD_ROOT
-    cmake \
-        -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
-        -DCMAKE_INSTALL_PREFIX=$BUILD_ROOT \
-        -DQNN_SDK_ROOT=${QNN_SDK_ROOT} \
-        -DEXECUTORCH_BUILD_QNN=ON \
-        -DEXECUTORCH_BUILD_DEVTOOLS=ON \
-        -DEXECUTORCH_BUILD_EXTENSION_MODULE=ON \
-        -DEXECUTORCH_BUILD_EXTENSION_DATA_LOADER=ON \
-        -DEXECUTORCH_BUILD_EXTENSION_FLAT_TENSOR=ON \
-        -DEXECUTORCH_BUILD_KERNELS_QUANTIZED=ON \
-        -DEXECUTORCH_BUILD_EXTENSION_TENSOR=ON \
-        -DEXECUTORCH_ENABLE_EVENT_TRACER=ON \
-        -DPYTHON_EXECUTABLE=$PYTHON_EXECUTABLE \
-        -S $PRJ_ROOT \
-        -B $BUILD_ROOT \
-
-    cmake --build $BUILD_ROOT -j$BUILD_JOB_NUMBER --target install
-
-    rm -f $PRJ_ROOT/backends/qualcomm/python/*
-    cp -fv $BUILD_ROOT/backends/qualcomm/Py* "$PRJ_ROOT/backends/qualcomm/python"
-    cp -fv "$PRJ_ROOT/schema/program.fbs" "$PRJ_ROOT/exir/_serialize/program.fbs"
-    cp -fv "$PRJ_ROOT/schema/scalar_type.fbs" "$PRJ_ROOT/exir/_serialize/scalar_type.fbs"
-
-   EXAMPLE_ROOT=examples/qualcomm
-   CMAKE_PREFIX_PATH="${BUILD_ROOT}/lib/cmake/ExecuTorch;${BUILD_ROOT}/third-party/gflags;"
-
-   echo "Update tokenizers submodule..."
-   pushd $PRJ_ROOT/extension/llm/tokenizers
-   git submodule update --init
-   popd
-   cmake $PRJ_ROOT/$EXAMPLE_ROOT \
-       -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
-       -DCMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH \
-       -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH \
-       -DPYTHON_EXECUTABLE=$PYTHON_EXECUTABLE \
-       -B$EXAMPLE_ROOT
-
-   cmake --build $EXAMPLE_ROOT -j$BUILD_JOB_NUMBER
-fi

@@ -60,3 +60,8 @@ xcuserdata/
 
 # Android
 *.aar
+build-*
+*.log
+link
+test/dataset
+examples/qualcomm/oss_scripts/llama/runner/save

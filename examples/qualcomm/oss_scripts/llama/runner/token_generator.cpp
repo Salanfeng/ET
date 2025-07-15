@@ -6,8 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <executorch/examples/qualcomm/oss_scripts/llama/runner/token_generator.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
+
+#include <fstream>
 #include <numeric>
+#include <iostream>
 using executorch::aten::TensorImpl;
 using executorch::runtime::MethodMeta;
 using executorch::runtime::Result;
@@ -249,5 +253,101 @@ Result<int64_t> TokenGenerator::generate(
     }
   }
   return pos - start_pos;
+}
+
+
+Result<int64_t> TokenGenerator::generate_ppl(
+    const std::vector<uint64_t>& tokens,
+    int64_t start_pos,
+    PerplexityCalculator* ppl_calculator,
+    std::ofstream* log_stream
+    ) {
+  int64_t pos = start_pos;
+  kv_manager_->rearrange_cache(metadata_.ar_len);
+  std::vector<int32_t> attention_map(metadata_.ar_len);
+  std::iota(attention_map.begin(), attention_map.end(), -1);
+  kv_manager_->init_attention_mask(attention_mask_.data, attention_map, metadata_.ar_len, pos);
+  ET_CHECK_MSG(
+      decoder_runner_->set_outputs(method_name_, output_tensors_) == executorch::runtime::Error::Ok,
+      "Failed to set output tensor for module %s", method_name_.c_str());
+
+  size_t n = tokens.size();
+  int64_t ppl_count = 0;
+
+  for (size_t i = start_pos; i < n - 1; ++i, ++pos) {
+    uint64_t cur_token = tokens[i];
+    uint64_t next_token = tokens[i + 1];
+    uint64_t predicted_token = 0;
+    prepare_io(cur_token, pos);
+    bool updated = kv_manager_->update_cache_tensor(
+        k_cache_in_, k_cache_out_, v_cache_in_, v_cache_out_, metadata_.ar_len, pos);
+    if (updated) {
+      ET_CHECK_MSG(
+          decoder_runner_->set_outputs(method_name_, output_tensors_) == executorch::runtime::Error::Ok,
+          "Failed to set output tensor for module %s", method_name_.c_str());
+    }
+    auto logits_res = decoder_runner_->step(method_name_, inputs_);
+    ET_CHECK_OK_OR_RETURN_ERROR(logits_res.error());
+    executorch::aten::Tensor& logits_tensor = logits_res.get();
+    predicted_token =
+        decoder_runner_->logits_to_token(logits_tensor, metadata_.ar_len);
+
+    auto* logits = logits_tensor.mutable_data_ptr<uint16_t>();
+    auto num_tokens = logits_tensor.size(1);
+    auto vocab_size = logits_tensor.size(2);
+    static std::vector<float> logits_float(vocab_size);
+    auto* logits_last = logits;
+    if (num_tokens > 1) {
+      logits_last += pos * vocab_size;
+    }
+
+    static bool quantization_params_inferred = false;
+    static float scale = 1.0f;
+    static float zero_point = 0.0f;
+    
+    if (!quantization_params_inferred) {
+      scale = 0.0008768149418756366f;
+      zero_point = 21326.0f;
+      std::cout << "Using quantization parameters : "
+          << "scale=" << scale << ", zero_point=" << zero_point << std::endl;
+      quantization_params_inferred = true;
+    }
+
+    float max_logit = -1e30f;
+    for (int j = 0; j < vocab_size; j++) {
+      logits_float[j] = (static_cast<float>(logits_last[j]) - zero_point) * scale;
+      if (logits_float[j] > max_logit) max_logit = logits_float[j];
+    }
+
+    // softmax计算
+    float sum_exp = 0.0f;
+    for (int j = 0; j < vocab_size; ++j) {
+      sum_exp += std::exp(logits_float[j] - max_logit);
+    }
+    float log_sum_exp = std::log(sum_exp);
+    double log_prob = logits_float[next_token] - log_sum_exp - max_logit;
+    ppl_calculator->update(log_prob);
+    ++ppl_count;
+    // 日志输出
+    if (log_stream && log_stream->is_open() && i % 20 == 0) {
+      // auto predicted_prob = logits_float[predicted_token] / sum_exp;
+      // auto decode_res = tokenizer_->decode(predicted_token, predicted_token);
+      // std::string predicted_token_str = decode_res.ok() ? decode_res.get() : "";
+      // auto decode_res_next = tokenizer_->decode(next_token, next_token);
+      // std::string next_token_str = decode_res_next.ok() ? decode_res_next.get() : "";
+      float current_ppl = 0.0f;
+      if (ppl_calculator->total_tokens > 0) {
+        current_ppl = std::exp(-ppl_calculator->total_log_prob / ppl_calculator->total_tokens);
+      }
+      (*log_stream) << "pos=" << pos << ", current_ppl=" << current_ppl << std::endl;
+        // << ", predicted_token_str=" << predicted_token_str << ", predicted_prob= " << predicted_prob
+        // << ", right_token_str=" << next_token_str << ", right_prob= " << prob
+        // << ", log_prob=" << log_prob
+        
+    }
+    kv_manager_->update_cache(metadata_.ar_len, pos, metadata_.ar_len, {});
+    kv_manager_->update_attention_mask(attention_mask_.data, metadata_.ar_len, pos, metadata_.ar_len);
+  }
+  return ppl_count;
 }
 } // namespace example

@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <fstream>
 
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/decoder_runner.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/imem_alloc.h>
@@ -24,6 +25,7 @@
 #include <executorch/extension/llm/runner/stats.h>
 #include <executorch/extension/module/module.h>
 #include <pytorch/tokenizers/tokenizer.h>
+
 namespace example {
 
 enum LlamaVersion {
@@ -55,6 +57,16 @@ class Runner {
       bool warming = false);
   void stop() {};
   executorch::runtime::Result<LlamaVersion> get_llama_version();
+
+
+  float compute_perplexity(
+    const std::string& prompt,
+    int32_t n_ctx = 512,
+    int32_t stride = 128,
+    std::ofstream* log_stream = nullptr,
+    std::function<void(const std::string&)> token_callback = nullptr,
+    PerplexityCalculator * ppl_calculator = nullptr,
+    int32_t idx = 0);
 
  private:
   enum EvalMode {

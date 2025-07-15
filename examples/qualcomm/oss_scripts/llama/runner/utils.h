@@ -19,3 +19,31 @@ struct TensorStruct {
   // data size in bytes
   size_t size;
 };
+
+
+struct PerplexityCalculator {
+    double total_log_prob = 0.0;
+    size_t total_tokens = 0;
+    float current_ppl = 0.0f;
+
+    explicit PerplexityCalculator() = default;
+
+    void reset() {
+        total_log_prob = 0.0;
+        total_tokens = 0;
+        current_ppl = 0.0f;
+    }
+
+    void update(double log_prob) {
+        total_log_prob += log_prob;
+        total_tokens++;
+    }
+
+    void finalize() {
+        if (total_tokens > 0) {
+            current_ppl = static_cast<float>(std::exp(-total_log_prob / total_tokens));
+        } else {
+            current_ppl = 0.0f;
+        }
+    }
+};

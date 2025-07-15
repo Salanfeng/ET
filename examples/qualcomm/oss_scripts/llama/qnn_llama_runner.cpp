@@ -14,11 +14,15 @@
  *
  */
 
+#include <cmath>
 #include <executorch/backends/qualcomm/runtime/QnnExecuTorch.h>
 #include <executorch/examples/qualcomm/oss_scripts/llama/runner/runner.h>
+#include <executorch/examples/qualcomm/oss_scripts/llama/runner/utils.h>
 #include <executorch/runtime/platform/log.h>
 #include <gflags/gflags.h>
 #include <fstream>
+#include <iostream>
+#include <numeric>
 #include <vector>
 
 DEFINE_string(
@@ -38,6 +42,15 @@ DEFINE_string(
     prompt,
     "The answer to the ultimate question is",
     "User prompts for Llama. When multiple prompts are entered, a multi-turn conversation will be initiated. Note that this feature is currently for testing purposes only.");
+DEFINE_string(
+    prompt_path,
+    "",
+    "File containing prompts, one per line. If specified, this will override the --prompt flag. Note that this feature is currently for testing purposes only.");
+DEFINE_int32(
+    chunk_idx,
+    0,
+    "");
+
 DEFINE_string(
     system_prompt,
     "",
@@ -81,7 +94,30 @@ std::vector<std::string> CollectPrompts(int argc, char** argv) {
       prompts.push_back(argv[i + 1]);
       i++; // Skip the next argument
     }
+    if (std::string(argv[i]) == "--prompt_path" && i + 1 < argc) {
+      std::ifstream prompt_file(argv[i + 1]);
+      if (!prompt_file.is_open()) {
+        ET_LOG(
+            Error,
+            "Failed to open prompt file: %s",
+            argv[i + 1]);
+        continue;
+      }
+      std::string line;
+      std::string all_prompts;
+      // while (std::getline(prompt_file, line)) {
+      //   if (!all_prompts.empty()) {
+      //     all_prompts.append("\n");
+      //   }
+      //   all_prompts.append(line);
+      // }
+      // prompts.push_back(all_prompts);
+      while (std::getline(prompt_file, line)) {
+        prompts.push_back(line);
+      }
+    }
   }
+
   return prompts;
 }
 
@@ -136,15 +172,34 @@ int main(int argc, char** argv) {
       buf.push_back(c);
     }
   };
-  // generate tokens & store inference output
+  // ========== PPL 计算开始 ==========
+  std::ofstream log_stream("ppl.log");
+  std::cout << "Running perplexity calculation for " << FLAGS_num_iters
+            << " iterations." <<  "prompts size: " << prompts.size() << std::endl;
+  (log_stream) << "Running perplexity calculation for "
+               << FLAGS_num_iters << " iterations." <<  "prompts size: "
+               << prompts.size() << std::endl;
+  PerplexityCalculator ppl_calculator;
   for (int i = 0; i < FLAGS_num_iters; i++) {
+    int j = 0;
     for (const auto& prompt : prompts) {
-      std::string formatted_prompt;
-      formatted_prompt = get_formatted_prompt(
+      std::cout << "Iteration " << j + 1 << ": Processing prompt: " << prompt
+                << std::endl;
+      (log_stream) << "Iteration " << j + 1 << ": Processing prompt: " << prompt
+                   << std::endl;
+      // 每30轮暂停一次
+      if ((j + 1) % 30 == 0) {
+        std::cout << "Press Enter to continue..." << j + 1 << std::endl;
+        std::cin.get();
+      }
+      j++;
+      std::string formatted_prompt = get_formatted_prompt(
           prompt, FLAGS_system_prompt, llama_version.get());
-      runner.generate(formatted_prompt.c_str(), FLAGS_seq_len, callback);
+      float ppl = runner.compute_perplexity(formatted_prompt.c_str(), 512, 512, &log_stream, callback, &ppl_calculator, FLAGS_chunk_idx);
+      std::cout << "Final PPL: " << ppl << std::endl;
     }
   }
+  // ========== PPL 计算结束 ==========
   fout.write(buf.data(), buf.size());
   fout.close();
   return 0;

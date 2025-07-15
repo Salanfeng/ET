@@ -50,6 +50,14 @@ class TokenGenerator {
       IMemAlloc* buffer_manager,
       executorch::runtime::Result<executorch::runtime::MethodMeta> method_meta);
 
+
+  virtual executorch::runtime::Result<int64_t> generate_ppl(
+      const std::vector<uint64_t>& tokens,
+      int64_t start_pos,
+      PerplexityCalculator* ppl_calculator,
+      std::ofstream* log_stream = nullptr
+    );
+
   /**
      * @brief Generate tokens.
      * @param tokens Vector of input tokens.
@@ -67,9 +75,9 @@ class TokenGenerator {
     return input_toks_.size + input_pos_.size + attention_mask_.size +
         logits_.size;
   }
-
- protected:
+  
   tokenizers::Tokenizer* tokenizer_;
+ protected:
   DecoderRunner* decoder_runner_;
   KVManager* kv_manager_;
   std::string method_name_;
