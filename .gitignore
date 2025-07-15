@@ -65,3 +65,5 @@ build-*
 link
 test/dataset
 examples/qualcomm/oss_scripts/llama/runner/save
+doc
+*.gif
