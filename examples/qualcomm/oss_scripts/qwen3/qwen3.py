@@ -29,7 +29,6 @@ from executorch.backends.qualcomm._passes.utils import (
 )
 
 from executorch.backends.qualcomm.builders.utils import is_graph_output
-
 from executorch.backends.qualcomm.quantizer.custom_annotation import (
     annotate_linear_16a8w_in_affine_layer,
     annotate_matmul_16a8w,
@@ -85,8 +84,8 @@ from executorch.extension.llm.export.builder import DType
 from pytorch_tokenizers import get_tokenizer, TiktokenTokenizer, HuggingFaceTokenizer
 from pytorch_tokenizers.llama2c import Llama2cTokenizer as SentencePieceTokenizer
 
-from torch.ao.quantization.observer import MinMaxObserver
-from torch.ao.quantization.quantize_pt2e import convert_pt2e, prepare_pt2e
+from torchao.quantization.pt2e import MinMaxObserver
+from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
 
 from gptqmodel import GPTQModel
 from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
