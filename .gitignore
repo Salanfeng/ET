@@ -67,3 +67,6 @@ test/dataset
 examples/qualcomm/oss_scripts/llama/runner/save
 doc
 *.gif
+examples/qualcomm/oss_scripts/qwen3
+examples/qualcomm/oss_scripts/qwen_vl
+llama_qn*
