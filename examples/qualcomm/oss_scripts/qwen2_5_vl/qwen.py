@@ -59,9 +59,9 @@ from executorch.devtools.backend_debug import print_delegation_info
 from executorch.examples.models.llama.source_transformation.quantize import (
     get_quant_embedding_transform,
 )
-from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
-    LlamaModel,
-    ModelArgs,
+from executorch.examples.qualcomm.oss_scripts.qwen2_5_vl.model.static_qwen2_5_vl import (
+    Qwen2_5_VLForConditionalGeneration,
+    Qwen2_5_VLConfig,
 )
 from executorch.examples.qualcomm.utils import (
     make_output_dir,
@@ -79,11 +79,19 @@ from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.passes.memory_planning_pass import MemoryPlanningPass
 from executorch.extension.llm.custom_ops import model_sharding
 from executorch.extension.llm.export.builder import DType
-from pytorch_tokenizers import get_tokenizer, TiktokenTokenizer
-from pytorch_tokenizers.llama2c import Llama2cTokenizer as SentencePieceTokenizer
+from pytorch_tokenizers import get_tokenizer, TiktokenTokenizer, HuggingFaceTokenizer
 
 from torchao.quantization.pt2e import MinMaxObserver
 from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
+
+try:
+    from transformers import Qwen2_5_VLForConditionalGeneration as HFQwen2_5_VLForConditionalGeneration
+    from transformers import Qwen2_5_VLConfig as HFQwen2_5_VLConfig
+    from transformers import AutoTokenizer
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+    logging.warning("HuggingFace transformers not available, using fallback implementation")
 
 sys.setrecursionlimit(4096)
 FORMAT = "[%(levelname)s %(asctime)s %(filename)s:%(lineno)s] %(message)s"
@@ -148,10 +156,11 @@ def _kv_calibrate(
     all_pos = torch.arange(0, max_seq_len, 1, dtype=torch.int32).unsqueeze(0)
 
     token_list = []
-    # Llama2 tokenizer has no special tokens
-    if isinstance(tokenizer, SentencePieceTokenizer):
-        token_list = tokenizer.encode(user_prompts, bos=True, eos=False)
-    elif isinstance(tokenizer, TiktokenTokenizer):
+    if isinstance(tokenizer, TiktokenTokenizer):
+        token_list = tokenizer.encode(
+            user_prompts, bos=True, eos=False, allowed_special="all"
+        )
+    elif isinstance(tokenizer, HuggingFaceTokenizer):
         token_list = tokenizer.encode(
             user_prompts, bos=True, eos=False, allowed_special="all"
         )
@@ -220,10 +229,11 @@ def _prefill_calibrate(
     # TODO: change criteria & support batch inputs if necessary
 
     token_list = []
-    # Llama2 tokenizer has no special tokens
-    if isinstance(tokenizer, SentencePieceTokenizer):
-        token_list = tokenizer.encode(user_prompts, bos=True, eos=False)
-    elif isinstance(tokenizer, TiktokenTokenizer):
+    if isinstance(tokenizer, TiktokenTokenizer):
+        token_list = tokenizer.encode(
+            user_prompts, bos=True, eos=False, allowed_special="all"
+        )
+    elif isinstance(tokenizer, HuggingFaceTokenizer):
         token_list = tokenizer.encode(
             user_prompts, bos=True, eos=False, allowed_special="all"
         )
@@ -293,14 +303,14 @@ def calibrate(
 
 
 class SingleLlama:
-    def __init__(self, llama_model, pte_filename) -> None:
+    def __init__(self, qwen_model, pte_filename) -> None:
         super().__init__()
-        self.llama_model = llama_model
+        self.qwen_model = qwen_model
         self.passes_job = get_capture_program_passes()
         self.dep_table = get_passes_dependency_for_capture_program()
         self.quant_attrs = None
         self.quant_dtype = None
-        self.llama_meta = self.llama_model.get_metadata()
+        self.llama_meta = self.qwen_model.get_metadata()
         self.has_quant_io = False
         self.pte_filename = pte_filename
         if self.llama_meta["get_use_kv_cache"]:
@@ -311,7 +321,7 @@ class SingleLlama:
         else:
             tokens, atten_mask = self.get_example_inputs(use_kv_cache=False)
             self.inputs = (tokens, atten_mask)
-        self.llama_graph_module = llama_model
+        self.llama_graph_module = qwen_model
         self.io_shape = {
             # logit output
             (
@@ -425,7 +435,7 @@ class SingleLlama:
         self,
         work_space,
         use_fp16=False,
-        soc_model=QcomChipset.SM8750,
+        soc_model=QcomChipset.SM8650,
         num_sharding=1,
         shared_buffer=False,
         verbose=False,
@@ -479,7 +489,7 @@ class SingleLlama:
                 exec_prog_mgr.write_to_file(file)
 
     def get_example_inputs(self, use_kv_cache=True):
-        return self.llama_model.get_example_inputs(use_kv_cache)
+        return self.qwen_model.get_example_inputs(use_kv_cache)
 
     def get_quant_attrs(self):
         return self.quant_attrs
@@ -489,30 +499,21 @@ def compile(args, pte_filename, tokenizer):
     os.makedirs(args.artifact, exist_ok=True)
     start_ts = time.time()
 
-    with open(args.params) as f:
-        kv_config = ModelArgs(**json.load(f))
-        # TODO: support batch inputs if necessary
-        kv_config.max_batch_size = 1
-        kv_config.max_seq_len = args.max_seq_len
-        kv_config.use_kv_cache = True
+    config = HFQwen2_5_VLConfig.from_pretrained(args.model_dir)
 
-        prefill_config = copy.copy(kv_config)
-        prefill_config.max_seq_len = args.max_seq_len
-        prefill_config.use_kv_cache = (
-            False if args.max_seq_len == args.prefill_ar_len else True
-        )
-
-    state_dict = torch.load(
-        args.checkpoint, weights_only=True, map_location="cpu", mmap=True
+    hf_model = HFQwen2_5_VLForConditionalGeneration.from_pretrained(
+        args.model_dir,
+        torch_dtype="auto",
+        device_map="cpu",
     )
-
+    
     llama_instance_list = []
     use_i64_token = args.embedding_quantize is not None
     with torch.device("meta"):
         if args.model_mode == "kv":
             llama_instance_list.append(
-                LlamaModel(
-                    kv_config,
+                Qwen2_5_VLForConditionalGeneration(
+                    config,
                     ar_len=1,
                     output_new_cache_only=True,
                     output_cache=True,
@@ -521,8 +522,8 @@ def compile(args, pte_filename, tokenizer):
             )
         elif args.model_mode == "hybrid":
             llama_instance_list.append(
-                LlamaModel(
-                    kv_config,
+                Qwen2_5_VLForConditionalGeneration(
+                    config,
                     ar_len=1,
                     output_new_cache_only=True,
                     output_cache=True,
@@ -530,8 +531,8 @@ def compile(args, pte_filename, tokenizer):
                 )
             )
             llama_instance_list.append(
-                LlamaModel(
-                    prefill_config,
+                Qwen2_5_VLForConditionalGeneration(
+                    config,
                     ar_len=args.prefill_ar_len,
                     output_new_cache_only=True,
                     output_cache=True,
@@ -540,8 +541,8 @@ def compile(args, pte_filename, tokenizer):
             )
         elif args.model_mode == "lookahead":
             llama_instance_list.append(
-                LlamaModel(
-                    kv_config,
+                Qwen2_5_VLForConditionalGeneration(
+                    config,
                     # To get better performance, we round up to the nearest power of 2.
                     ar_len=next_power_of_two(
                         (args.window + args.gcap) * (args.ngram - 1)
@@ -552,8 +553,8 @@ def compile(args, pte_filename, tokenizer):
                 )
             )
             llama_instance_list.append(
-                LlamaModel(
-                    prefill_config,
+                Qwen2_5_VLForConditionalGeneration(
+                    config,
                     ar_len=args.prefill_ar_len,
                     output_new_cache_only=True,
                     output_cache=True,
@@ -563,30 +564,9 @@ def compile(args, pte_filename, tokenizer):
         else:
             raise RuntimeError(f"Unknown model_mode: {args.model_mode}.")
 
-    if "model" in state_dict:
-        state_dict = state_dict["model"]
-
-    # Change to HuggingFace weight to improve the performance of RoPE in HTP backend.
-    def permute(w, heads):
-        dim_0 = w.size(0)
-        dim_1 = w.size(1)
-        return (
-            w.view(heads, dim_0 // heads // 2, 2, dim_1)
-            .transpose(1, 2)
-            .reshape(dim_0, dim_1)
-        )
-
-    n_heads = llama_instance_list[0].n_heads
-    n_kv_heads = llama_instance_list[0].n_kv_heads
-    n_layers = llama_instance_list[0].n_layers
-
-    for layer_i in range(n_layers):
-        state_dict[f"layers.{layer_i}.attention.wq.weight"] = permute(
-            state_dict[f"layers.{layer_i}.attention.wq.weight"], n_heads
-        )
-        state_dict[f"layers.{layer_i}.attention.wk.weight"] = permute(
-            state_dict[f"layers.{layer_i}.attention.wk.weight"], n_kv_heads
-        )
+    state_dict = hf_model.state_dict()
+    
+    # pass permute
 
     for llama_instance in llama_instance_list:
         llama_instance.load_state_dict(
@@ -597,12 +577,18 @@ def compile(args, pte_filename, tokenizer):
     end_load_ts = time.time()
     logging.info(f"Time for loading checkpoint: {end_load_ts - start_ts}")
 
+    # Prepare models for HTP optimization using the unified method
     for llama_instance in llama_instance_list:
-        for layer in llama_instance.layers:
-            if getattr(layer.attention, "prepare_sha", None):
-                layer.attention.prepare_sha()
-            if getattr(layer.feed_forward, "prepare_feedfoward_conv", None):
-                layer.feed_forward.prepare_feedfoward_conv()
+        if hasattr(llama_instance.model, 'prepare_for_htp'):
+            llama_instance.model.prepare_for_htp(use_sha=True, use_fp16_gemm=True)
+        else:
+            # Fallback to individual layer preparation if needed
+            logging.warning("Using fallback HTP preparation method...")
+            for layer in llama_instance.model.layers:
+                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, "prepare_sha"):
+                    layer.self_attn.prepare_sha()
+                if hasattr(layer, 'mlp') and hasattr(layer.mlp, "prepare_feedforward_conv"):
+                    layer.mlp.prepare_feedforward_conv()
 
     use_fp16 = True
     fixed_point_type = {"kv_type": torch.float32, "io_type": torch.float32}
@@ -621,7 +607,7 @@ def compile(args, pte_filename, tokenizer):
             ], f"No support for quant type {args.ptq}. Support 8a8w, 16a4w and 16a4w_block."
         quant_dtype = getattr(QuantDtype, f"use_{args.ptq}")
 
-    assert args.tokenizer_model is not None, "Need tokenizer model for calibration"
+    assert args.tokenizer_json is not None, "Need tokenizer model for calibration"
 
     if args.dtype_override is not None:
         dtype_override = DType[args.dtype_override]
@@ -647,10 +633,6 @@ def compile(args, pte_filename, tokenizer):
     if args.ptq:
         start_quantize_ts = time.time()
         custom_annotations = (annotate_matmul_16a8w,)
-        if args.llama_model == "stories110m":
-            custom_annotations = custom_annotations + (
-                annotate_linear_16a8w_in_affine_layer,
-            )
         kv_quant_attrs = {}
         for i, llama_instance in enumerate(llama_instance_list):
             llama_instance.quantize(
@@ -781,132 +763,6 @@ def compile(args, pte_filename, tokenizer):
     return quant_attrs
 
 
-def inference(args, pte_filename, runtime_tokenizer_path, pre_gen_pte=""):
-    workspace = f"/data/local/tmp/{getpass.getuser()}/executorch/single_llama"
-
-    if args.model_mode == "kv":
-        eval_mode = 0
-    elif args.model_mode == "hybrid":
-        eval_mode = 1
-    elif args.model_mode == "lookahead":
-        eval_mode = 2
-    else:
-        raise RuntimeError(f"Unknown model_mode: {args.model_mode}.")
-
-    pte_path = (
-        f"{pre_gen_pte}/{pte_filename}.pte"
-        if pre_gen_pte
-        else f"{args.artifact}/{pte_filename}.pte"
-    )
-
-    # collect output data
-    output_data_folder = f"{args.artifact}/outputs"
-    make_output_dir(output_data_folder)
-    outputs = []
-
-    def post_process():
-        with open(f"{args.artifact}/outputs/outputs.txt", "r") as f:
-            outputs.append(f.read())
-
-    seq_len = args.max_seq_len
-    multi_prompts = " ".join([f'--prompt "{prompt}"' for prompt in args.prompt])
-    runner_args = " ".join(
-        [
-            multi_prompts,
-            f"--eval_mode {eval_mode}",
-            f"--temperature {args.temperature}",
-            f"--system_prompt '{args.system_prompt}'",
-        ]
-    )
-
-    runner_cmd = ""
-    performance_output_path = "outputs/inference_speed.txt"
-    if args.enable_x86_64:
-        # x86 emulator is intended for CI and not performance. Check only the first few tokens.
-        seq_len = min(seq_len, 16)
-
-        if args.kv_updater == smart_mask_updater:
-            logging.warning(
-                "x86 only support ShiftPointer, overwrite kv_updater to ShiftPointer"
-            )
-
-        qnn_sdk = os.getenv("QNN_SDK_ROOT")
-        target = "x86_64-linux-clang"
-        runner_cmd = " ".join(
-            [
-                f"export LD_LIBRARY_PATH={qnn_sdk}/lib/{target}/:{args.build_folder}/lib &&",
-                f"./{args.build_folder}/examples/qualcomm/oss_scripts/llama/qnn_llama_runner",
-                f"--tokenizer_path {runtime_tokenizer_path}",
-                f"--model_path {pte_path}",
-                f"--seq_len {seq_len}",
-                f"--output_path {args.artifact}/outputs/outputs.txt",
-                f"--performance_output_path {performance_output_path}",
-                f"--kv_updater ShiftPointer",
-                runner_args,
-            ]
-        )
-        subprocess.run(
-            runner_cmd,
-            shell=True,
-            executable="/bin/bash",
-            capture_output=True,
-        )
-        post_process()
-    else:
-        runner_cmd = " ".join(
-            [
-                f"cd {workspace} &&",
-                f"./qnn_llama_runner",
-                f"--tokenizer_path {os.path.basename(runtime_tokenizer_path)}",
-                f"--model_path {pte_filename}.pte",
-                f"--seq_len {seq_len}",
-                "--output_path outputs/outputs.txt",
-                f"--performance_output_path {performance_output_path}",
-                f"--kv_updater {'SmartMask' if args.kv_updater == smart_mask_updater else 'ShiftPointer'}",
-                f"--window {args.window}",
-                f"--gcap {args.gcap}",
-                f"--ngram {args.ngram}",
-                runner_args,
-            ]
-        )
-
-        adb = SimpleADB(
-            qnn_sdk=os.getenv("QNN_SDK_ROOT"),
-            build_path=f"{args.build_folder}",
-            pte_path=pte_path,
-            workspace=workspace,
-            device_id=args.device,
-            host_id=args.host,
-            soc_model=args.model,
-            shared_buffer=args.shared_buffer,
-            runner=f"examples/qualcomm/oss_scripts/llama/qnn_llama_runner",
-        )
-        # No pregen inputs, input_list is not required
-        adb.push(inputs=[], input_list="", files=[runtime_tokenizer_path])
-        adb.execute(custom_runner_cmd=runner_cmd)
-
-        adb.pull(output_path=args.artifact, callback=post_process)
-    if args.ip and args.port != -1:
-        inference_speed = 0
-        with open(f"{args.artifact}/{performance_output_path}", "r") as f:
-            inference_speed = float(f.read())
-
-        pte_size = os.path.getsize(pte_path)
-        with Client((args.ip, args.port)) as conn:
-            conn.send(
-                json.dumps(
-                    {
-                        "result": outputs,
-                        "pte_size": pte_size,
-                        "inference_speed": inference_speed,
-                    }
-                )
-            )
-    else:
-        for idx, output in enumerate(outputs):
-            logging.info(f"Results[{idx}]:\n{output}")
-
-
 def _build_parser():
     parser = setup_common_args_and_variables()
     parser.add_argument(
@@ -925,36 +781,34 @@ def _build_parser():
     )
 
     parser.add_argument(
-        "--llama_model",
-        choices=["stories110m", "llama3_2"],
-        help="The Llama model to export. Current available options are: [stories110m, llama3_2]",
+        "--qwen_model",
+        choices=["qwen2_5_vl"],
+        help="The Llama model to export. Current available options are: [qwen2_5_vl]",
         required=True,
     )
 
     parser.add_argument(
-        "--checkpoint",
+        "--model_dir",
         help="Pass llama checkpoint.",
         required=True,
         type=str,
     )
 
-    parser.add_argument(
-        "--params",
-        help="Pass llama params json file.",
-        required=True,
-        type=str,
-    )
+    # parser.add_argument(
+    #     "--tokenizer_bin",
+    #     help="For Llama2. Pass Llama2 tokenizer binary.",
+    #     required=False,
+    #     type=str,
+    # )
 
     parser.add_argument(
-        "--tokenizer_bin",
-        help="For Llama2. Pass Llama2 tokenizer binary.",
-        required=False,
+        "--tokenizer_json",
         type=str,
+        default=None,
     )
-
+    
     parser.add_argument(
-        "--tokenizer_model",
-        help="Pass llama tokenizer model.",
+        "--tokenizer_config",
         type=str,
         default=None,
     )
@@ -1006,7 +860,7 @@ def _build_parser():
     parser.add_argument(
         "--model_mode",
         help="Export and inference kv mode, hybrid mode, or lookahead decoding mode",
-        default="kv",
+        default="hybrid",
         choices=["kv", "hybrid", "lookahead"],
         type=str,
     )
@@ -1014,14 +868,14 @@ def _build_parser():
     parser.add_argument(
         "--max_seq_len",
         help="This refers to maximum number of tokens that the model can process & consider at once to generate predictions/responses.",
-        default=512,
+        default=1024,
         type=int,
     )
 
     parser.add_argument(
         "--prefill_ar_len",
         help="The auto-regression (AR) length determines the number of tokens to consume and the number of logits to produce. Use this option to process the prompt and generate the key-value (kv) cache, which serves as a prompt processor for hybrid and lookahead mode.",
-        default=32,
+        default=64,
         type=int,
     )
 
@@ -1067,17 +921,17 @@ def _build_parser():
     return parser
 
 
-def export_llama(args) -> None:
+def export_qwen(args) -> None:
     if args.compile_only and args.pre_gen_pte:
         raise RuntimeError("Cannot set both compile_only and pre_gen_pte as true")
 
     if args.model_mode == "kv":
-        pte_filename = "kv_llama_qnn"
+        pte_filename = "kv_qwen_qnn"
     elif args.model_mode == "hybrid":
         assert (
             args.max_seq_len >= args.prefill_ar_len
         ), "Please ensure max_seq_len is >= prefill_ar_len"
-        pte_filename = "hybrid_llama_qnn"
+        pte_filename = "hybrid_qwen_qnn"
     elif args.model_mode == "lookahead":
         assert (
             args.max_seq_len >= args.prefill_ar_len
@@ -1085,28 +939,18 @@ def export_llama(args) -> None:
         assert args.max_seq_len > next_power_of_two(
             (args.window + args.gcap) * (args.ngram - 1)
         ), "Please ensure max_seq_len is > next_power_of_two((args.window + args.gcap) * (args.ngram - 1))"
-        pte_filename = "lookahead_llama_qnn"
+        pte_filename = "lookahead_qwen_qnn"
     else:
         raise RuntimeError(f"Unknown model_mode: {args.model_mode}.")
 
-    tokenizer = get_tokenizer(args.tokenizer_model)
-    runtime_tokenizer_path = ""
-    if args.llama_model == "stories110m":
+    tokenizer = get_tokenizer(args.tokenizer_json, args.tokenizer_config)
+    if args.qwen_model == "qwen2_5_vl":
         assert isinstance(
-            tokenizer, SentencePieceTokenizer
-        ), f"Wrong tokenizer provided for stories110m."
-        assert (
-            args.tokenizer_bin is not None
-        ), "Please provide tokenizer_bin for stories110m."
-        runtime_tokenizer_path = args.tokenizer_bin
-    elif args.llama_model == "llama3_2":
-        assert isinstance(
-            tokenizer, TiktokenTokenizer
-        ), f"Wrong tokenizer provided for llama3_2."
-        runtime_tokenizer_path = args.tokenizer_model
+            tokenizer, HuggingFaceTokenizer
+        ), f"Wrong tokenizer provided for qwen2_5_vl."
     else:
-        raise RuntimeError(f"Unknown llama_model: {args.llama_model}.")
-
+        raise RuntimeError(f"Unknown llama model: {args.qwen_model}.")
+    
     if args.kv_updater == "smart_mask":
         args.shared_buffer = True
         args.kv_updater = smart_mask_updater
@@ -1114,11 +958,6 @@ def export_llama(args) -> None:
         args.kv_updater = shift_pointer_updater
     else:
         raise RuntimeError(f"Using an unknown kv update {args.kv_updater}")
-
-    if args.pre_gen_pte:
-        inference(args, pte_filename, runtime_tokenizer_path, args.pre_gen_pte)
-        print(f"Finish the running pre_gen_pte from {args.pre_gen_pte}")
-        return
 
     if args.compile_only:
         compile(args, pte_filename, tokenizer)
@@ -1135,23 +974,13 @@ def export_llama(args) -> None:
                     )
                 )
         print(f"Finish compile_only and save to {args.artifact}")
-        return
-
-    compile(args, pte_filename, tokenizer)
-    inference(args, pte_filename, runtime_tokenizer_path)
+    return
 
 
 def main():
     parser = _build_parser()
     args = parser.parse_args()
-    try:
-        export_llama(args)
-    except Exception as e:
-        if args.ip and args.port != -1:
-            with Client((args.ip, args.port)) as conn:
-                conn.send(json.dumps({"Error": str(e)}))
-        else:
-            raise Exception(e)
+    export_qwen(args)
 
 
 # flake8: noqa: C901
