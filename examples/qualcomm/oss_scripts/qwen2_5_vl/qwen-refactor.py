@@ -237,7 +237,9 @@ def _kv_calibrate(
             user_prompts, bos=True, eos=False, allowed_special="all"
         )
     elif isinstance(tokenizer, HuggingFaceTokenizer):
-        token_list = tokenizer.encode(user_prompts, bos=True, eos=False)
+        token_list = tokenizer.encode(
+            user_prompts, bos=True, eos=False, allowed_special="all"
+        )
     else:
         raise RuntimeError("Unknown tokenizer")
 
@@ -581,16 +583,13 @@ def compile(args, pte_filename, tokenizer):
         device_map="cpu",
     )
     
-    # Convert Qwen2.5-VL config to ModelArgs for LLaMA-style processing
-    model_args = qwen_config_to_model_args(config, max_seq_len=args.max_seq_len)
-    
     llama_instance_list = []
     use_i64_token = args.embedding_quantize is not None
     with torch.device("meta"):
         if args.model_mode == "kv":
             llama_instance_list.append(
-                LlamaModel(
-                    model_args,
+                Qwen2_5_VLForConditionalGeneration(
+                    config,
                     ar_len=1,
                     output_new_cache_only=True,
                     output_cache=True,
@@ -599,8 +598,8 @@ def compile(args, pte_filename, tokenizer):
             )
         elif args.model_mode == "hybrid":
             llama_instance_list.append(
-                LlamaModel(
-                    model_args,
+                Qwen2_5_VLForConditionalGeneration(
+                    config,
                     ar_len=1,
                     output_new_cache_only=True,
                     output_cache=True,
@@ -608,8 +607,8 @@ def compile(args, pte_filename, tokenizer):
                 )
             )
             llama_instance_list.append(
-                LlamaModel(
-                    model_args,
+                Qwen2_5_VLForConditionalGeneration(
+                    config,
                     ar_len=args.prefill_ar_len,
                     output_new_cache_only=True,
                     output_cache=True,
@@ -618,8 +617,8 @@ def compile(args, pte_filename, tokenizer):
             )
         elif args.model_mode == "lookahead":
             llama_instance_list.append(
-                LlamaModel(
-                    model_args,
+                Qwen2_5_VLForConditionalGeneration(
+                    config,
                     # To get better performance, we round up to the nearest power of 2.
                     ar_len=next_power_of_two(
                         (args.window + args.gcap) * (args.ngram - 1)
@@ -630,8 +629,8 @@ def compile(args, pte_filename, tokenizer):
                 )
             )
             llama_instance_list.append(
-                LlamaModel(
-                    model_args,
+                Qwen2_5_VLForConditionalGeneration(
+                    config,
                     ar_len=args.prefill_ar_len,
                     output_new_cache_only=True,
                     output_cache=True,
@@ -641,9 +640,9 @@ def compile(args, pte_filename, tokenizer):
         else:
             raise RuntimeError(f"Unknown model_mode: {args.model_mode}.")
 
-
-
-    state_dict = hf_model.model.state_dict()
+    state_dict = hf_model.state_dict()
+    
+    # pass permute
 
     for llama_instance in llama_instance_list:
         llama_instance.load_state_dict(
