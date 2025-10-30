@@ -37,6 +37,7 @@ TokenGenerator<T>::TokenGenerator(
 
   // Calculate I/O size
   input_toks_.size = metadata_.ar_len * sizeof(int64_t);
+  inputs_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
   input_pos_.size = metadata_.ar_len * sizeof(int32_t);
   attention_mask_.size =
       metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
@@ -44,7 +45,7 @@ TokenGenerator<T>::TokenGenerator(
   switch (metadata_.cache_mode) {
     case CacheMode::StaticCahce:
       attention_mask_.size =
-          metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
+           metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
       window_attention_mask_.size = 0;
       break;
     case CacheMode::HybridCache:
@@ -96,6 +97,20 @@ void TokenGenerator<T>::init_io(
   buffer_manager->add_memory_info(
       attention_mask_.data, attention_mask_.size, attention_mask.get());
 
+  // [I]: inputs_embeds
+  Result<TensorInfo> inputs_embeds = method_meta->input_tensor_meta(idx++);
+  inputs_embeds_.data = reinterpret_cast<uint16_t*>(
+      buffer_manager->allocate(inputs_embeds_.size));
+  inputs_embeds_.tensor = std::make_unique<TensorImpl>(
+      inputs_embeds->scalar_type(),
+      inputs_embeds->sizes().size(),
+      const_cast<TensorImpl::SizesType*>(inputs_embeds->sizes().data()),
+      inputs_embeds_.data,
+      const_cast<TensorImpl::DimOrderType*>(inputs_embeds->dim_order().data()));
+  input_tensors_.emplace_back(inputs_embeds_.tensor.get());
+  buffer_manager->add_memory_info(
+      inputs_embeds_.data, inputs_embeds_.size, inputs_embeds.get());
+
   // [I]: sliding window attention_mask
   if (metadata_.cache_mode == CacheMode::HybridCache) {
     Result<TensorInfo> window_attention_mask =
@@ -132,7 +147,7 @@ void TokenGenerator<T>::init_io(
       input_pos_.data, input_pos_.size, input_pos.get());
 
   // [I] kv_cache
-  size_t index = idx; // bypass input_tokens, atten_mask, input_pos
+  size_t index = idx; // bypass input_tokens, atten_mask, inputs_embeds, input_pos
   for (int cache_group = 0; cache_group < 2; ++cache_group) {
     std::vector<std::vector<std::unique_ptr<TensorImpl>>>& cache =
         (cache_group == 0 ? k_cache_in_ : v_cache_in_);

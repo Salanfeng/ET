@@ -30,6 +30,7 @@ class TokenGenerator {
     int64_t num_layers;
     int32_t ar_len;
     int32_t vocab_size;
+    int64_t hidden_size;
     bool use_int64_token;
     int sliding_window;
     CacheMode cache_mode;
@@ -77,10 +78,10 @@ class TokenGenerator {
       bool dump_logits);
   inline const size_t total_token_generator_io_size_in_bytes() const {
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
+      return input_toks_.size + inputs_embeds_.size + input_pos_.size + attention_mask_.size +
           window_attention_mask_.size + logits_.size;
     } else {
-      return input_toks_.size + input_pos_.size + attention_mask_.size +
+      return input_toks_.size + inputs_embeds_.size + input_pos_.size + attention_mask_.size +
           logits_.size;
     }
   }
@@ -94,6 +95,7 @@ class TokenGenerator {
 
   // inputs and outputs
   TensorStruct<int64_t> input_toks_;
+  TensorStruct<uint16_t> inputs_embeds_;
   TensorStruct<int32_t> input_pos_;
   TensorStruct<uint16_t> attention_mask_;
   TensorStruct<uint16_t> window_attention_mask_;

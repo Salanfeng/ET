@@ -40,6 +40,7 @@ DEFINE_string(
     dump_logits_path,
     "",
     "If path is provided, program will dump all logits generated. This option is for analysis purpose. It is not recommended for general usage as it will cause token rate drop and increase in memory usage.");
+DEFINE_string(embeds_path, "", "Path to the input embeddings file like inputs_embeds.txt");
 DEFINE_string(tokenizer_path, "tokenizer.bin", "Tokenizer stuff.");
 DEFINE_string(
     prompt,
@@ -139,7 +140,15 @@ std::string get_formatted_prompt(
       formatted_prompt.append("<|end|><|assistant|>");
       break;
     case example::DecoderModelVersion::kQwen2_5:
+      if (!system_prompt.empty()) {
+        formatted_prompt.append("<|im_start|>system\n");
+        formatted_prompt.append(system_prompt);
+        formatted_prompt.append("<|im_end|>\n");
+      }
+      formatted_prompt.append("<|im_start|>user\n");
       formatted_prompt.append(prompt);
+      formatted_prompt.append("<|im_end|>\n");
+      formatted_prompt.append("<|im_start|>assistant");
       break;
     case example::DecoderModelVersion::kQwen3:
       formatted_prompt.append("<|im_start|>user\n");
@@ -187,6 +196,7 @@ void start_runner(
   bool use_tokenized_prompt =
       gflags::GetCommandLineFlagInfoOrDie("tokenized_prompt").is_default ? false
                                                                          : true;
+  bool use_embeds = !gflags::GetCommandLineFlagInfoOrDie("embeds_path").is_default;
   // create llama runner
   example::Runner<T> runner(
       std::move(module),
@@ -220,7 +230,10 @@ void start_runner(
       0};
   if (use_tokenized_prompt) {
     runner.generate_from_prompt_or_file(
-        FLAGS_tokenized_prompt.c_str(), use_tokenized_prompt, config, callback);
+        FLAGS_tokenized_prompt.c_str(), use_tokenized_prompt, use_embeds, config, callback);
+  } else if (use_embeds) {
+    runner.generate_from_prompt_or_file(
+        FLAGS_embeds_path.c_str(), use_tokenized_prompt, use_embeds, config, callback);
   } else {
     // generate tokens & store inference output
     for (int i = 0; i < FLAGS_num_iters; i++) {
@@ -229,12 +242,14 @@ void start_runner(
         formatted_prompt = get_formatted_prompt(
             prompt, FLAGS_system_prompt, decoder_model_version.get());
         runner.generate_from_prompt_or_file(
-            formatted_prompt.c_str(), use_tokenized_prompt, config, callback);
+            formatted_prompt.c_str(), use_tokenized_prompt, use_embeds, config, callback);
       }
     }
   }
 
   fout.write(buf.data(), buf.size());
+  printf("%s", buf.data());
+  printf("\n");
   fout.close();
 }
 

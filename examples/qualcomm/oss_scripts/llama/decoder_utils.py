@@ -56,6 +56,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
         tokenizer: Union[
             SentencePieceTokenizer, TiktokenTokenizer, HuggingFaceTokenizer
         ],
+        tok_embeddings: torch.nn.Embedding,
         max_seq_length: int,
         ar_len: int,
         use_kv_cache: bool,
@@ -77,6 +78,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
         self.kv_updater = kv_updater
         self.use_i64_token = use_i64_token
         self.seq_mse_candidates = seq_mse_candidates
+        self.tok_embeddings = tok_embeddings
 
     def _model_call(self, inps):
         all_logits = None
@@ -91,6 +93,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
             inps,
             self._model,
             self._tokenizer,
+            self.tok_embeddings,
             max_seq_len=self.max_seq_length,
             use_i64_token=self.use_i64_token,
             collect_logits=True,
@@ -482,6 +485,7 @@ def kv_inference(  # noqa: C901
     prompt: Union[str, list],
     module: torch.fx.GraphModule,
     tokenizer,
+    tok_embeddings,
     ar_len=1,
     max_seq_len=512,
     kv_updater=smart_mask_updater,
@@ -490,7 +494,7 @@ def kv_inference(  # noqa: C901
     seq_mse_candidates=0,
     lookahead_config=None,
 ):
-    _, atten_mask, _, k_caches, v_caches = get_example_inputs(use_kv_cache=True)
+    _, atten_mask, _, _, k_caches, v_caches = get_example_inputs(use_kv_cache=True)
 
     # TODO: change criteria & support batch inputs if necessary
     all_pos = torch.arange(0, max_seq_len, 1, dtype=torch.int32).unsqueeze(0)
@@ -529,6 +533,8 @@ def kv_inference(  # noqa: C901
             tmp_token_list[0, :num_tokens_in_chunk] = torch.tensor(
                 actual_chunk_tokens, dtype=dtype
             )
+            
+            inputs_embeds = tok_embeddings(tmp_token_list)
 
             # Prepare tmp_pos (padded with zeros).
             tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
@@ -541,6 +547,7 @@ def kv_inference(  # noqa: C901
             logits, new_k_caches, new_v_caches = module(
                 tmp_token_list,
                 *atten_mask,
+                inputs_embeds,
                 tmp_pos,
                 *k_caches,
                 *v_caches,
@@ -591,6 +598,8 @@ def kv_inference(  # noqa: C901
                 tmp_token_list[0, :num_tokens_in_chunk] = torch.tensor(
                     actual_chunk_tokens, dtype=dtype
                 )
+                
+                inputs_embeds = tok_embeddings(tmp_token_list)
 
                 # Prepare tmp_pos (padded with zeros).
                 tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
@@ -601,6 +610,7 @@ def kv_inference(  # noqa: C901
                 logits, new_k_caches, new_v_caches = module(
                     tmp_token_list,
                     *atten_mask,
+                    inputs_embeds,
                     tmp_pos,
                     *k_caches,
                     *v_caches,
@@ -710,11 +720,12 @@ def prefill_inference(
     prompt: Union[str, list],
     module: torch.fx.GraphModule,
     tokenizer,
+    tok_embeddings,
     max_seq_len=512,
     use_i64_token=False,
     collect_logits=False,
 ):
-    _, atten_mask = get_example_inputs(use_kv_cache=False)
+    _, atten_mask, _ = get_example_inputs(use_kv_cache=False)
 
     # TODO: change criteria & support batch inputs if necessary
 
@@ -768,6 +779,7 @@ def graph_module_inference(
     get_example_inputs: Callable,
     module: torch.fx.GraphModule,
     tokenizer,
+    tok_embeddings,
     ar_len=1,
     max_seq_len=512,
     kv_updater=smart_mask_updater,
@@ -801,6 +813,7 @@ def graph_module_inference(
             prompt,
             module,
             tokenizer,
+            tok_embeddings,
             max_seq_len=max_seq_len,
             use_i64_token=use_i64_token,
             collect_logits=False,
@@ -810,6 +823,7 @@ def graph_module_inference(
         calibration_wrapper = GraphModuleCalibrationWrapper(
             model=module,
             tokenizer=tokenizer,
+            tok_embeddings=tok_embeddings,
             max_seq_length=max_seq_len,
             ar_len=ar_len,
             use_kv_cache=use_kv_cache,

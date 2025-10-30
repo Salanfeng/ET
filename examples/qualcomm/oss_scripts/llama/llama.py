@@ -142,9 +142,10 @@ class SingleLlama:
         self.inputs = (
             inputs[0],  # tokens
             *inputs[1],  # attn_mask
-            *((inputs[2],) if self.llama_meta["get_use_kv_cache"] else []),  # pos_ids
-            *(inputs[3] if self.llama_meta["get_use_kv_cache"] else []),  # k_caches
-            *(inputs[4] if self.llama_meta["get_use_kv_cache"] else []),  # v_caches
+            inputs[2],  # input_embeds
+            *((inputs[3],) if self.llama_meta["get_use_kv_cache"] else []),  # pos_ids
+            *(inputs[4] if self.llama_meta["get_use_kv_cache"] else []),  # k_caches
+            *(inputs[5] if self.llama_meta["get_use_kv_cache"] else []),  # v_caches
         )
         self.llama_graph_module = decoder_model
         self.io_shape = {
@@ -155,6 +156,7 @@ class SingleLlama:
                 self.llama_meta["get_vocab_size"],
             ),
         }
+        self.tok_embeddings = decoder_model.tok_embeddings
 
     def _tag_ios(self, node, fixed_point_type):
         if not self.has_quant_io:
@@ -261,6 +263,7 @@ class SingleLlama:
                 get_example_inputs=self.get_example_inputs,
                 module=fx_graph_module,
                 tokenizer=tokenizer,
+                tok_embeddings=self.tok_embeddings,
                 ar_len=self.llama_meta["get_ar_len"],
                 max_seq_len=self.llama_meta["get_max_seq_len"],
                 kv_updater=args.kv_updater,
@@ -285,6 +288,7 @@ class SingleLlama:
             get_example_inputs=self.get_example_inputs,
             module=fx_graph_module,
             tokenizer=tokenizer,
+            tok_embeddings=self.tok_embeddings,
             ar_len=self.llama_meta["get_ar_len"],
             max_seq_len=self.llama_meta["get_max_seq_len"],
             kv_updater=args.kv_updater,
@@ -310,6 +314,7 @@ class SingleLlama:
                     get_example_inputs=self.get_example_inputs,
                     module=self.llama_graph_module,
                     tokenizer=tokenizer,
+                    tok_embeddings=self.tok_embeddings,
                     ar_len=self.llama_meta["get_ar_len"],
                     max_seq_len=self.llama_meta["get_max_seq_len"],
                     kv_updater=args.kv_updater,
@@ -339,6 +344,7 @@ class SingleLlama:
                 get_example_inputs=self.get_example_inputs,
                 module=self.llama_graph_module,
                 tokenizer=tokenizer,
+                tok_embeddings=self.tok_embeddings,
                 ar_len=self.llama_meta["get_ar_len"],
                 max_seq_len=self.llama_meta["get_max_seq_len"],
                 kv_updater=args.kv_updater,
@@ -363,7 +369,14 @@ class SingleLlama:
                                 2
                             ]
                             break
-
+    
+    def save_ie_quant_attrs(self):
+        for node in self.llama_graph_module.graph.nodes:
+            if node.name == "inputs_embeds":
+                next_node = node._next
+                self.llama_meta["get_ie_logits_scale"] = next_node.args[1]
+                self.llama_meta["get_ie_logits_zero_point"] = next_node.args[2]
+                break
     def lowering_modules(
         self,
         work_space,
@@ -460,6 +473,14 @@ def compile(
         False if args.max_seq_len == args.prefill_ar_len else True
     )
 
+    ############ test area ############
+    prefill_config.use_embeds = True
+    # kv_config.n_layers = 1 # for testing, reduce layer to 1
+    # prefill_config.n_layers = 1
+    if prefill_config.use_embeds:
+        logging.info("Using input_embeds for prefill")
+    ###################################
+    
     llama_instance_list = []
     use_i64_token = args.embedding_quantize is not None
     extra_kwargs = {}
@@ -472,7 +493,7 @@ def compile(
             hf_config.text_config.rope_local_base_freq
         )
         extra_kwargs["sliding_window"] = hf_config.sliding_window
-
+    
     with torch.device("meta"):
         if args.model_mode == "kv":
             llama_instance_list.append(
@@ -816,6 +837,7 @@ def compile(
         ]
 
         llama_instance_list[1].save_logits_quant_attrs()
+        llama_instance_list[1].save_ie_quant_attrs()
         edge_prog_mgr = to_edge_transform_and_lower_to_qnn(
             {
                 graph_name: instance.llama_graph_module
@@ -1177,7 +1199,7 @@ def _build_parser():
     parser.add_argument(
         "--prefill_ar_len",
         help="The auto-regression (AR) length determines the number of tokens to consume and the number of logits to produce. Use this option to process the prompt and generate the key-value (kv) cache, which serves as a prompt processor for hybrid and lookahead mode.",
-        default=32,
+        default=128,
         type=int,
     )
 

@@ -95,6 +95,10 @@ class ModelArgs:
     # Additional Model Metadata needed at runtime
     bos_idx: int = 1
     eos_idx: int = 3
+    vision_start_token_id: int = 151652
+    vision_end_token_id: int = 151653
+    vision_token_id: int = 151654
+    image_token_id: int = 151655
     bos_count: int = -1  # i.e., a single EOS is used as BOS
     eos_count: int = 2
 
@@ -114,6 +118,9 @@ class ModelArgs:
     kv_io_bit_width: Optional[int] = (
         None  # KV cache bit width. This is for QNN backend only for now.
     )
+    use_embeds: bool = False # use input_embeds, skip `hidden_states = self.tok_embeddings(tokens)`
+    use_mrope: bool = False # use modified RoPE
+    mrope_section: Optional[list] = None # section for mRoPE, e.g. [16,24,24] for Qwen2.5
     attention_kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
     # Hybrid models can have layer types different from attention
     layer_types: Optional[list] = None

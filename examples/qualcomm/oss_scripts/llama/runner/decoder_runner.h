@@ -19,6 +19,14 @@ class DecoderRunner {
       executorch::extension::Module* module,
       int32_t vocab_size,
       float temperature);
+
+  DecoderRunner(
+      executorch::extension::Module* module,
+      int32_t vocab_size,
+      float temperature,
+      float logits_scale,
+      int logits_zero_point);
+
   /**
    * Run LLM text decoder with inputs to generate next token.
    * @param inputs The inputs to the LLM Module.
@@ -65,10 +73,9 @@ class DecoderRunner {
     if (num_tokens > 1) {
       logits_last += pos * vocab_size;
     }
-    // Discard dequantization (converting uint16_t to float) because the
-    // relative order of elements remains the same without conversion
+    // Apply dequantization using scale and zero point
     for (int i = 0; i < vocab_size; i++) {
-      logits_f[i] = logits_last[i];
+      logits_f[i] = (logits_last[i] - logits_zero_point_) * logits_scale_;
     }
     return sampler_->sample(logits_f.data());
   }
@@ -76,5 +83,7 @@ class DecoderRunner {
  protected:
   executorch::extension::Module* module_;
   std::unique_ptr<executorch::extension::llm::Sampler> sampler_;
+  double logits_scale_ = 1.0f;
+  int64_t logits_zero_point_ = 0;
 };
 } // namespace example

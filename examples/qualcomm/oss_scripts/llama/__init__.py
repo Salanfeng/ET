@@ -23,7 +23,9 @@ from executorch.backends.qualcomm.quantizer.qconfig import (
     get_ptq_per_channel_quant_config,
 )
 from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
-
+from executorch.examples.models.qwen2_5_vl import (
+    convert_weights as convert_qwen2_5_vl_weights,
+)
 from executorch.examples.models.gemma import convert_weights as convert_gemma_weights
 from executorch.examples.models.gemma3 import convert_weights as convert_gemma3_weights
 from executorch.examples.models.phi_4_mini import (
@@ -243,6 +245,28 @@ class LlamaStories110M(LLMModelConfig):
         annotate_output_16a8w,
         partial(annotate_wv_sha, quantization_config=quantization_config_wv_sha_8a4w),
     )
+
+@register_llm_model("qwen2_5_vl_3b")
+@dataclass(init=False, frozen=True)
+class Qwen2_5_VL_3B(LLMModelConfig):
+    repo_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    params_path: str = os.path.join(
+        BASE_DIR, "../../../models/qwen2_5_vl/config/3b_config.json"
+    )
+    convert_weights = convert_qwen2_5_vl_weights
+    transform_weight = False
+    instruct_model = True
+    
+    num_sharding = 1
+    # quant config
+    ptq = QuantDtype.use_16a8w
+    group_size = 16
+    masked_softmax = False
+    seq_mse_candidates = 0
+    r1 = False
+    r2 = False
+    r3 = True
+    custom_annotation = (annotate_output_16a8w,)
 
 
 @register_llm_model("llama3_2-1b_instruct")

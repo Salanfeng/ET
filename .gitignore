@@ -67,7 +67,19 @@ xcuserdata/
 
 # Android
 *.aar
-
-# Windows
-*.dll
-*.pyd
+build-*
+*.log
+link
+test/dataset
+examples/qualcomm/oss_scripts/llama/runner/save
+docs
+*.gif
+examples/qualcomm/oss_scripts/qwen3
+llama_qnn*
+qwen_qnn*
+examples/qualcomm/oss_scripts/tests
+.ci
+.github
+*.etdp
+/models
+examples/mediatek

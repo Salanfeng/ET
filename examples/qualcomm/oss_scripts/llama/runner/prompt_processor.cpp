@@ -31,6 +31,7 @@ PromptProcessor<T>::PromptProcessor(
   v_cache_out_.resize(metadata_.num_layers);
   // Calculate I/O size
   input_toks_.size = metadata_.ar_len * sizeof(int64_t);
+  inputs_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
   if (is_bert())
     input_pos_.size = 0;
   else
@@ -75,7 +76,7 @@ void PromptProcessor<T>::init_io(
   input_tensors_.emplace_back(input_toks_.tensor.get());
   buffer_manager->add_memory_info(
       input_toks_.data, input_toks_.size, input_toks.get());
-
+  
   // [I]: attention_mask
   Result<TensorInfo> attention_mask = method_meta->input_tensor_meta(idx++);
   attention_mask_.data = reinterpret_cast<uint16_t*>(
@@ -90,6 +91,20 @@ void PromptProcessor<T>::init_io(
   input_tensors_.emplace_back(attention_mask_.tensor.get());
   buffer_manager->add_memory_info(
       attention_mask_.data, attention_mask_.size, attention_mask.get());
+
+  // [I]: inputs_embeds
+  Result<TensorInfo> inputs_embeds = method_meta->input_tensor_meta(idx++);
+  inputs_embeds_.data = reinterpret_cast<uint16_t*>(
+      buffer_manager->allocate(inputs_embeds_.size));
+  inputs_embeds_.tensor = std::make_unique<TensorImpl>(
+      inputs_embeds->scalar_type(),
+      inputs_embeds->sizes().size(),
+      const_cast<TensorImpl::SizesType*>(inputs_embeds->sizes().data()),
+      inputs_embeds_.data,
+      const_cast<TensorImpl::DimOrderType*>(inputs_embeds->dim_order().data()));
+  input_tensors_.emplace_back(inputs_embeds_.tensor.get());
+  buffer_manager->add_memory_info(
+      inputs_embeds_.data, inputs_embeds_.size, inputs_embeds.get());
 
   // [I]: sliding window attention_mask
   if (metadata_.cache_mode == CacheMode::HybridCache) {
@@ -128,7 +143,7 @@ void PromptProcessor<T>::init_io(
         input_pos_.data, input_pos_.size, input_pos.get());
 
     // [I] kv_cache
-    size_t index = idx; // bypass input_tokens, atten_mask, input_pos
+    size_t index = idx; // bypass input_tokens, atten_mask, inputs_embeds, input_pos
     for (int cache_group = 0; cache_group < 2; ++cache_group) {
       std::vector<std::vector<std::unique_ptr<TensorImpl>>>& cache =
           (cache_group == 0 ? k_cache_in_ : v_cache_in_);
@@ -209,6 +224,7 @@ const std::vector<uint16_t>& PromptProcessor<T>::get_all_logits() {
 template <typename T>
 void PromptProcessor<T>::prepare_io(
     const std::vector<uint64_t>& prompt_tokens,
+    const std::vector<uint16_t>& inputs_embeds,
     int64_t prompt_pos,
     int64_t start_pos) {
   for (int i = 0; i < metadata_.ar_len; i++) {
@@ -229,18 +245,31 @@ void PromptProcessor<T>::prepare_io(
         input_toks_ptr[i] = static_cast<int32_t>(prompt_tokens[prompt_pos + i]);
       }
     }
+    if (inputs_embeds.size() / metadata_.hidden_size > prompt_pos + i) {
+      // copy the line of inputs_embeds to the input_embeds tensor
+      std::memcpy(
+          inputs_embeds_.data,
+          inputs_embeds.data() + (prompt_pos + i) * metadata_.hidden_size,
+          metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t));
+    }
   }
 }
 
 template <typename T>
 Result<uint64_t> PromptProcessor<T>::prefill(
     std::vector<uint64_t> prompt_tokens,
+    std::vector<uint16_t> inputs_embeds,
     int64_t start_pos,
     bool dump_logits) {
-  ET_CHECK_MSG(!prompt_tokens.empty(), "Prompt cannot be null");
+  ET_CHECK_MSG(!prompt_tokens.empty() || !inputs_embeds.empty(), "Prompt cannot be null");
 
   // Calculate number of blocks
-  int32_t num_prompt_tokens = prompt_tokens.size();
+  int32_t num_prompt_tokens = 0;
+  if (prompt_tokens.empty()) {
+    num_prompt_tokens = inputs_embeds.size() / metadata_.hidden_size;
+  } else {
+    num_prompt_tokens = prompt_tokens.size();
+  }
   if (!is_bert()) {
     ET_CHECK_MSG(
         (start_pos + num_prompt_tokens) <=
@@ -289,7 +318,7 @@ Result<uint64_t> PromptProcessor<T>::prefill(
       method_name_.c_str());
   for (int i = 0; i < num_iters; ++i) {
     // Fill in the token and position data
-    prepare_io(prompt_tokens, prompt_pos, pos);
+    prepare_io(prompt_tokens, inputs_embeds, prompt_pos, pos);
     // Only update data pointer of the cache to the tensor for SHIFT_POINTER
     // mode
     bool updated = kv_manager_->update_cache_tensor(

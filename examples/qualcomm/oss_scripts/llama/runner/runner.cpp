@@ -227,6 +227,7 @@ Error Runner<T>::load() {
   ET_CHECK_MSG(num_layers != -1, "Could not retrieve num layers");
   // k_cache: [1, head_dim, seq_len]
   int64_t head_dim = method_meta->output_tensor_meta(1)->sizes()[1];
+  int64_t hidden_size = ET_UNWRAP(module_->get("get_dim")).toScalar().to<int64_t>();
   int64_t num_heads = (method_meta->num_outputs() - 1) / (num_layers * 2);
   bool use_int64_token = method_meta->input_tensor_meta(0)->scalar_type() ==
       executorch::aten::ScalarType::Long;
@@ -285,6 +286,7 @@ Error Runner<T>::load() {
           num_layers,
           prompt_processor_ar_len,
           vocab_size,
+          hidden_size,
           use_int64_token,
           sliding_window,
           cache_mode_});
@@ -301,6 +303,7 @@ Error Runner<T>::load() {
             num_layers,
             token_generator_ar_len,
             vocab_size,
+            hidden_size,
             use_int64_token,
             ngram_,
             window_,
@@ -321,6 +324,7 @@ Error Runner<T>::load() {
             num_layers,
             token_generator_ar_len,
             vocab_size,
+            hidden_size,
             use_int64_token,
             sliding_window,
             cache_mode_},
@@ -353,17 +357,21 @@ Error Runner<T>::generate(
     std::function<void(const std::string&)> token_callback,
     std::function<void(const Stats&)> stats_callback) {
   return generate_from_prompt_or_file(
-      prompt, false, config, token_callback, stats_callback);
+      prompt, false, false, config, token_callback, stats_callback);
 }
 
 template <typename T>
 Error Runner<T>::generate_from_prompt_or_file(
     const std::string& prompt,
     bool tokenized_prompt,
+    bool embeds,
     const llm::GenerationConfig& config,
     std::function<void(const std::string&)> token_callback,
     std::function<void(const Stats&)> stats_callback) {
-  ET_CHECK_MSG(!prompt.empty(), "prompt cannot be null");
+
+  std::vector<uint16_t> input_embeds(0);
+
+  ET_CHECK_MSG(!prompt.empty() || !input_embeds.empty(), "prompt cannot be null");
   if (!is_loaded()) {
     stats_.model_load_start_ms = time_in_ms();
     ET_CHECK_OK_OR_RETURN_ERROR(load());
@@ -376,7 +384,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   int32_t n_bos = (cur_pos_ == 0) ? 1 : 0;
 
   // encode the (string) prompt into tokens sequence
-  std::vector<uint64_t> prompt_tokens;
+  std::vector<uint64_t> prompt_tokens(0);
   if (tokenized_prompt) {
     std::ifstream inFile(prompt, std::ios::binary);
     if (inFile.is_open()) {
@@ -396,6 +404,42 @@ Error Runner<T>::generate_from_prompt_or_file(
           "Unable to read tokenized prompt from file: %s",
           prompt.c_str());
     }
+  } else if (embeds) {
+      std::vector<float> input_embeds_tmp(0);
+      std::ifstream file(prompt, std::ios::binary);
+      if (!file.is_open()) {
+        ET_CHECK_MSG(false, "Failed to open %s", prompt.c_str());
+      } else {
+        file.seekg(0, std::ios::end);
+        size_t file_size = file.tellg();
+        file.seekg(0, std::ios::beg);
+        size_t num_elements = file_size / sizeof(float);
+        input_embeds_tmp.resize(num_elements);
+        file.read(reinterpret_cast<char*>(input_embeds_tmp.data()), input_embeds_tmp.size() * sizeof(float));
+        file.close();
+
+        // quantize input_embeds
+        double logits_scale_ = 1.0;
+        int64_t logits_zero_point_ = 0;
+        if (module_->method_names()->count("get_ie_logits_scale") > 0) {
+          logits_scale_ = module_->get("get_ie_logits_scale").get().toScalar().to<double>();
+        } else {
+          ET_CHECK_MSG(false, "get_ie_logits_scale method not found in the model");
+        }
+        if (module_->method_names()->count("get_ie_logits_zero_point") > 0) {
+          logits_zero_point_ = module_->get("get_ie_logits_zero_point").get().toScalar().to<int64_t>();
+        } else {
+          ET_CHECK_MSG(false, "get_ie_logits_zero_point method not found in the model");
+        }
+        ET_LOG(Info, "input_embeds quantization scale: %e zero point: %ld", logits_scale_, logits_zero_point_);
+        input_embeds.resize(input_embeds_tmp.size());
+        for (size_t i = 0; i < input_embeds_tmp.size(); i++) {
+          int32_t quantized_value = static_cast<int32_t>(
+              std::round(input_embeds_tmp[i] / logits_scale_) + logits_zero_point_);
+          quantized_value = std::max(0, std::min(65535, quantized_value));
+          input_embeds[i] = static_cast<uint16_t>(quantized_value);
+        }
+      }
   } else {
     tokenizers::Result<std::vector<uint64_t>> encode_res =
         tokenizer_->encode(prompt, n_bos, 0);
@@ -403,7 +447,7 @@ Error Runner<T>::generate_from_prompt_or_file(
         encode_res.error(), "failed to encode prompt %s", prompt.c_str());
     prompt_tokens = encode_res.get();
   }
-  int num_prompt_tokens = prompt_tokens.size();
+  int num_prompt_tokens = embeds? input_embeds.size() / 2048 : prompt_tokens.size(); //TODO
   ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
   ET_CHECK_MSG(
       cur_pos_ + num_prompt_tokens < seq_len,
@@ -415,7 +459,9 @@ Error Runner<T>::generate_from_prompt_or_file(
   }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
   auto prefill_res =
-      prompt_processor_->prefill(prompt_tokens, cur_pos_, dump_logits);
+      prompt_processor_->prefill(prompt_tokens, input_embeds, cur_pos_, dump_logits);
+  ET_LOG(Info, "finished prompt prefill");
+    
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
   uint64_t cur_token = prefill_res.get();
   cur_pos_ += num_prompt_tokens;

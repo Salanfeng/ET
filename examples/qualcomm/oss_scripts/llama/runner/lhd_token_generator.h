@@ -24,6 +24,7 @@ class LhdTokenGenerator : public TokenGenerator<T> {
     int64_t num_layers;
     int32_t ar_len;
     int32_t vocab_size;
+    int64_t hidden_size;
     bool use_int64_token;
     int32_t ngram;
     int32_t window;
@@ -51,6 +52,7 @@ class LhdTokenGenerator : public TokenGenerator<T> {
                 metadata.num_layers,
                 metadata.ar_len,
                 metadata.vocab_size,
+                metadata.hidden_size,
                 metadata.use_int64_token,
                 metadata.sliding_window,
                 metadata.cache_mode},

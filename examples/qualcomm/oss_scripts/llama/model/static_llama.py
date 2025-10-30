@@ -463,6 +463,7 @@ class LlamaModel(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        self.config = config
         self.dim = config.dim
         self.head_dim = config.head_dim
         self.max_batch_size = config.max_batch_size
@@ -508,6 +509,7 @@ class LlamaModel(nn.Module):
             )
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        self.use_embeds = config.use_embeds
 
     def prepare_output_conv(self):
         def forward_output_conv(x):
@@ -529,6 +531,7 @@ class LlamaModel(nn.Module):
         self,
         tokens: torch.Tensor,
         atten_mask: torch.Tensor,
+        inputs_embeds: torch.Tensor,
         input_pos: Optional[torch.Tensor] = None,
         *args,
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
@@ -543,7 +546,11 @@ class LlamaModel(nn.Module):
             self.freqs_sin[input_pos][0] if self.use_kv_cache else self.freqs_sin
         )
 
-        hidden_states = self.embedding_scale_factor * self.tok_embeddings(tokens)
+        if self.use_embeds:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.tok_embeddings(tokens)
+
         for ind, decoder_layer in enumerate(self.layers):
             k_caches = None
             v_caches = None
@@ -575,6 +582,7 @@ class LlamaModel(nn.Module):
         tokens = torch.randint(
             self.vocab_size, (self.max_batch_size, self.ar_len), dtype=dtype
         )
+        input_embeds = self.tok_embeddings(tokens)
         atten_mask = AttentionMask(
             CausalAttentionMask(self.max_batch_size, self.ar_len, self.max_seq_len)
         )
@@ -602,6 +610,7 @@ class LlamaModel(nn.Module):
             return (
                 tokens,
                 atten_mask,
+                input_embeds,
                 pos_ids,
                 k_cache,
                 v_cache,
@@ -610,14 +619,15 @@ class LlamaModel(nn.Module):
         return (
             tokens,
             atten_mask,
+            input_embeds,
         )
 
     def get_metadata(self):
         # TODO: modify this when enabling LLAMA 7B
         return {
             "get_ar_len": self.ar_len,
-            "get_bos_id": 1,
-            "get_eos_id": 2,
+            "get_bos_id": self.config.bos_idx,
+            "get_eos_id": self.config.eos_idx,
             "get_dim": self.dim,
             "get_head_dim": self.head_dim,
             "get_max_batch_size": self.max_batch_size,

@@ -24,13 +24,39 @@ namespace example {
 DecoderRunner::DecoderRunner(
     Module* module,
     int32_t vocab_size,
+    float temperature,
+    float logits_scale,
+    int logits_zero_point)
+    : module_(module),
+      sampler_(std::make_unique<Sampler>(
+          vocab_size,
+          temperature,
+          kTopp,
+          static_cast<unsigned long long>(std::time(nullptr)))),
+      logits_scale_(logits_scale),
+      logits_zero_point_(logits_zero_point) {}
+
+DecoderRunner::DecoderRunner(
+    Module* module,
+    int32_t vocab_size,
     float temperature)
     : module_(module),
       sampler_(std::make_unique<Sampler>(
           vocab_size,
           temperature,
           kTopp,
-          static_cast<unsigned long long>(std::time(nullptr)))) {}
+          static_cast<unsigned long long>(std::time(nullptr)))) {
+  if (module_->method_names()->count("get_logits_scale") > 0) {
+    logits_scale_ = module_->get("get_logits_scale").get().toScalar().to<double>();
+  } else {
+    ET_CHECK_MSG(false, "get_logits_scale method not found in module");
+  }
+  if (module_->method_names()->count("get_logits_zero_point") > 0) {
+    logits_zero_point_ = module_->get("get_logits_zero_point").get().toScalar().to<int64_t>();
+  } else {
+    ET_CHECK_MSG(false, "get_logits_zero_point method not found in module");
+  }
+}
 
 Error DecoderRunner::set_outputs(
     const std::string& method_name,
