@@ -257,7 +257,7 @@ class Qwen2_5_VL_3B(LLMModelConfig):
     transform_weight = False
     instruct_model = True
     
-    num_sharding = 1
+    num_sharding = 2
     # quant config
     ptq = QuantDtype.use_16a8w
     group_size = 16

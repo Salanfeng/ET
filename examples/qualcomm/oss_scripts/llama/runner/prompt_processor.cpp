@@ -248,9 +248,9 @@ void PromptProcessor<T>::prepare_io(
     if (inputs_embeds.size() / metadata_.hidden_size > prompt_pos + i) {
       // copy the line of inputs_embeds to the input_embeds tensor
       std::memcpy(
-          inputs_embeds_.data,
+          inputs_embeds_.data + i * metadata_.hidden_size,
           inputs_embeds.data() + (prompt_pos + i) * metadata_.hidden_size,
-          metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t));
+          metadata_.hidden_size * sizeof(uint16_t));
     }
   }
 }
