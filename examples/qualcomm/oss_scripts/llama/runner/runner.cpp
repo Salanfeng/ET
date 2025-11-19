@@ -24,7 +24,7 @@
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
 #include <algorithm>
 #include <fstream>
-
+#include <iostream>
 using executorch::extension::Module;
 using executorch::extension::llm::get_rss_bytes;
 using executorch::extension::llm::print_report;
@@ -37,6 +37,75 @@ namespace llm = ::executorch::extension::llm;
 
 namespace example {
 namespace {
+
+struct mtmd_binary_header {
+    char     magic[4];
+    uint32_t version;
+    uint32_t n_tokens;
+    uint32_t n_embd_dims;
+    uint32_t n_pos_dims;
+    uint32_t embd_type;
+    uint32_t pos_type;
+    uint32_t reserved[5];
+};
+
+enum ggml_type {
+    GGML_TYPE_F32  = 0,
+    GGML_TYPE_I32  = 26,
+};
+
+size_t ggml_type_size(uint32_t type) {
+    switch (type) {
+        case GGML_TYPE_F32: return 4;
+        case GGML_TYPE_I32: return 4;
+        default: throw std::runtime_error("不支持的类型");
+    }
+}
+
+void parse_mtmd(const std::string& path,
+                 std::vector<float>& embeddings,
+                 std::vector<uint16_t>& position_ids) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw std::runtime_error("无法打开文件");
+
+    mtmd_binary_header header;
+    file.read(reinterpret_cast<char*>(&header), sizeof(header));
+    
+    if (std::string(header.magic, 4) != "MTMD")
+        throw std::runtime_error("Magic number错误");
+
+    size_t embd_size = header.n_tokens * header.n_embd_dims * ggml_type_size(header.embd_type);
+    embeddings.resize(header.n_tokens * header.n_embd_dims);
+    file.read(reinterpret_cast<char*>(embeddings.data()), embd_size);
+
+    // 读取position数据
+    size_t pos_size = header.n_tokens * header.n_pos_dims * ggml_type_size(header.pos_type);
+    std::vector<int32_t> tmp_position_ids(header.n_tokens * header.n_pos_dims);
+    position_ids.resize(header.n_tokens * header.n_pos_dims);
+    file.read(reinterpret_cast<char*>(tmp_position_ids.data()), pos_size);
+    for (size_t i = 0; i < tmp_position_ids.size(); ++i) {
+        position_ids[i] = static_cast<uint16_t>(tmp_position_ids[i]);
+    }
+
+    // // 打印前3个token的样例
+    // std::cout << "\nEmbeddings (前3个token的前8维):\n";
+    // for (int i = 0; i < std::min(3u, header.n_tokens); ++i) {
+    //     std::cout << "  Token " << i << ": ";
+    //     for (int j = 0; j < std::min(8u, header.n_embd_dims); ++j) {
+    //         std::cout << embeddings[i * header.n_embd_dims + j] << " ";
+    //     }
+    //     std::cout << "...\n";
+    // }
+
+    // std::cout << "\nPosition IDs:\n";
+    // for (int i = 0; i < std::min(10u, (uint32_t)position_ids.size()); ++i) {
+    //     std::cout << position_ids[i] << " ";
+    // }
+    // std::cout << (position_ids.size() > 10 ? "...\n" : "\n");
+    file.close();
+}
+
+
 void print_performance_report(
     const Stats& stats,
     const std::string& performance_output_path) {
@@ -370,6 +439,7 @@ Error Runner<T>::generate_from_prompt_or_file(
     std::function<void(const Stats&)> stats_callback) {
 
   std::vector<uint16_t> input_embeds(0);
+  std::vector<uint16_t> all_position_ids(0);
 
   ET_CHECK_MSG(!prompt.empty() || !input_embeds.empty(), "prompt cannot be null");
   if (!is_loaded()) {
@@ -405,41 +475,45 @@ Error Runner<T>::generate_from_prompt_or_file(
           prompt.c_str());
     }
   } else if (embeds) {
-      std::vector<float> input_embeds_tmp(0);
-      std::ifstream file(prompt, std::ios::binary);
-      if (!file.is_open()) {
-        ET_CHECK_MSG(false, "Failed to open %s", prompt.c_str());
-      } else {
-        file.seekg(0, std::ios::end);
-        size_t file_size = file.tellg();
-        file.seekg(0, std::ios::beg);
-        size_t num_elements = file_size / sizeof(float);
-        input_embeds_tmp.resize(num_elements);
-        file.read(reinterpret_cast<char*>(input_embeds_tmp.data()), input_embeds_tmp.size() * sizeof(float));
-        file.close();
+      // std::vector<float> input_embeds_tmp(0);
+      // std::ifstream file(prompt, std::ios::binary);
 
-        // quantize input_embeds
-        double logits_scale_ = 1.0;
-        int64_t logits_zero_point_ = 0;
-        if (module_->method_names()->count("get_ie_logits_scale") > 0) {
-          logits_scale_ = module_->get("get_ie_logits_scale").get().toScalar().to<double>();
-        } else {
-          ET_CHECK_MSG(false, "get_ie_logits_scale method not found in the model");
-        }
-        if (module_->method_names()->count("get_ie_logits_zero_point") > 0) {
-          logits_zero_point_ = module_->get("get_ie_logits_zero_point").get().toScalar().to<int64_t>();
-        } else {
-          ET_CHECK_MSG(false, "get_ie_logits_zero_point method not found in the model");
-        }
-        ET_LOG(Info, "input_embeds quantization scale: %e zero point: %ld", logits_scale_, logits_zero_point_);
-        input_embeds.resize(input_embeds_tmp.size());
-        for (size_t i = 0; i < input_embeds_tmp.size(); i++) {
-          int32_t quantized_value = static_cast<int32_t>(
-              std::round(input_embeds_tmp[i] / logits_scale_) + logits_zero_point_);
-          quantized_value = std::max(0, std::min(65535, quantized_value));
-          input_embeds[i] = static_cast<uint16_t>(quantized_value);
-        }
+      // file.seekg(0, std::ios::end);
+      // size_t file_size = file.tellg();
+      // file.seekg(0, std::ios::beg);
+      // size_t num_elements = file_size / sizeof(float);
+      // input_embeds_tmp.resize(num_elements);
+      // file.read(reinterpret_cast<char*>(input_embeds_tmp.data()), input_embeds_tmp.size() * sizeof(float));
+      // file.close();
+      std::vector<float> input_embeds_tmp;
+
+      parse_mtmd(prompt, input_embeds_tmp, all_position_ids);
+
+      // quantize input_embeds
+      double logits_scale_ = 1.0;
+      int64_t logits_zero_point_ = 0;
+      if (module_->method_names()->count("get_ie_logits_scale") > 0) {
+        logits_scale_ = module_->get("get_ie_logits_scale").get().toScalar().to<double>();
+      } else {
+        ET_CHECK_MSG(false, "get_ie_logits_scale method not found in the model");
       }
+      if (module_->method_names()->count("get_ie_logits_zero_point") > 0) {
+        logits_zero_point_ = module_->get("get_ie_logits_zero_point").get().toScalar().to<int64_t>();
+      } else {
+        ET_CHECK_MSG(false, "get_ie_logits_zero_point method not found in the model");
+      }
+      ET_LOG(Info, "input_embeds quantization scale: %e zero point: %ld", logits_scale_, logits_zero_point_);
+      input_embeds.resize(input_embeds_tmp.size());
+      for (size_t i = 0; i < input_embeds_tmp.size(); i++) {
+        int32_t quantized_value = static_cast<int32_t>(
+            std::round(input_embeds_tmp[i] / logits_scale_) + logits_zero_point_);
+        quantized_value = std::max(0, std::min(65535, quantized_value));
+        input_embeds[i] = static_cast<uint16_t>(quantized_value);
+        // if (i < 2048) {
+        //   ET_LOG(Info, "input_embeds[%zu]: float=%f quantized=%u", i, input_embeds_tmp[i], input_embeds[i]);
+        // }
+      }
+      
   } else {
     tokenizers::Result<std::vector<uint64_t>> encode_res =
         tokenizer_->encode(prompt, n_bos, 0);
@@ -459,7 +533,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
   auto prefill_res =
-      prompt_processor_->prefill(prompt_tokens, input_embeds, cur_pos_, dump_logits);
+      prompt_processor_->prefill(prompt_tokens, input_embeds, all_position_ids, cur_pos_, dump_logits);
   ET_LOG(Info, "finished prompt prefill");
     
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
@@ -482,7 +556,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   // start the main loop
   prompt_tokens.push_back(cur_token);
   int64_t num_generated_tokens = ET_UNWRAP(token_generator_->generate(
-      prompt_tokens, cur_pos_, seq_len, token_callback, dump_logits));
+      prompt_tokens, all_position_ids, cur_pos_, seq_len, token_callback, dump_logits));
   stats_.inference_end_ms = time_in_ms();
   ET_LOG(
       Info,

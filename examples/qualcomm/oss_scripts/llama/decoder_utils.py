@@ -407,24 +407,27 @@ def smart_mask_updater(
 ):
     # ar_len is unused in smart mask
     max_cache_len = k_caches[0].size(-1)
+    try:
+        if pos + n_updates <= max_cache_len:
+            if lade_token_offset is not None:
+                # lookahead decode update
+                for i, offset in enumerate(lade_token_offset):
+                    current_pos = pos + i
+                    for j, (k_cache, v_cache) in enumerate(zip(k_caches, v_caches)):
+                        k_cache[:, :, current_pos] = new_k_caches[j][:, :, offset]
+                        v_cache[:, current_pos, :] = new_v_caches[j][:, offset, :]
+            else:
+                for i, k_cache in enumerate(k_caches):
+                    k_cache[:, :, pos : pos + n_updates] = new_k_caches[i][:, :, :n_updates]
+                for i, v_cache in enumerate(v_caches):
+                    v_cache[:, pos : pos + n_updates, :] = new_v_caches[i][:, :n_updates, :]
 
-    if pos + n_updates <= max_cache_len:
-        if lade_token_offset is not None:
-            # lookahead decode update
-            for i, offset in enumerate(lade_token_offset):
-                current_pos = pos + i
-                for j, (k_cache, v_cache) in enumerate(zip(k_caches, v_caches)):
-                    k_cache[:, :, current_pos] = new_k_caches[j][:, :, offset]
-                    v_cache[:, current_pos, :] = new_v_caches[j][:, offset, :]
-        else:
-            for i, k_cache in enumerate(k_caches):
-                k_cache[:, :, pos : pos + n_updates] = new_k_caches[i][:, :, :n_updates]
-            for i, v_cache in enumerate(v_caches):
-                v_cache[:, pos : pos + n_updates, :] = new_v_caches[i][:, :n_updates, :]
-
-        atten_mask.smart_mask_update(pos, n_updates, lade_pos_offset)
-
+            atten_mask.smart_mask_update(pos, n_updates, lade_pos_offset)
+    except Exception as e:
+        print("update error")
+        pass
     pos += n_updates
+
     return pos, k_caches, v_caches
 
 
@@ -494,7 +497,7 @@ def kv_inference(  # noqa: C901
     seq_mse_candidates=0,
     lookahead_config=None,
 ):
-    _, atten_mask, _, _, k_caches, v_caches = get_example_inputs(use_kv_cache=True)
+    _, atten_mask, _, position_ids, _, k_caches, v_caches = get_example_inputs(use_kv_cache=True)
 
     # TODO: change criteria & support batch inputs if necessary
     all_pos = torch.arange(0, max_seq_len, 1, dtype=torch.int32).unsqueeze(0)
@@ -511,11 +514,19 @@ def kv_inference(  # noqa: C901
             )
         else:
             raise RuntimeError("Unknown tokenizer")
+        if prompt.startswith("start"):
+            prompt_token_list = [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 785, 24456, 8500, 1356, 23113, 4119, 525, 3118, 389, 6351, 64074, 476, 55712, 278, 29728, 14155, 429, 2924, 458, 23668, 323, 264, 24551, 13, 576, 1850, 16380, 4119, 1083, 4564, 279, 23668, 323, 24551, 1526, 458, 6529, 16953, 13, 1205, 29614, 264, 501, 4285, 3922, 17646, 11, 279, 62379, 11, 3118, 21063, 389, 6529, 23783, 11, 35593, 287, 448, 75193, 323, 5686, 20201, 11368, 13, 151645, 198, 151644, 77091, 198]
     else:
         # pyre-ignore
         prompt_token_list = prompt.flatten().tolist()
     total_token_list = prompt_token_list
     dtype = torch.int64 if use_i64_token else torch.int32
+
+    position_ids = torch.zeros((3, 1, max_seq_len), dtype=torch.int32)
+    for i in range(3):
+        position_ids[i] = torch.arange(
+            start=0, end=max_seq_len, step=1, dtype=torch.int32
+        ).unsqueeze(0).repeat(1, 1)
 
     with torch.no_grad():
         # Phase 1: Prefill the prompt in ar_len chunks.
@@ -535,6 +546,15 @@ def kv_inference(  # noqa: C901
             )
             
             inputs_embeds = tok_embeddings(tmp_token_list)
+            
+            tmp_position_ids = torch.zeros((3, 1, ar_len), dtype=torch.int32)
+            for i in range(3):
+                tmp_position_ids[i] = torch.arange(
+                    start=pos,
+                    end=pos + ar_len,
+                    step=1,
+                    dtype=torch.int32,
+                ).unsqueeze(0).repeat(1, 1)
 
             # Prepare tmp_pos (padded with zeros).
             tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
@@ -548,6 +568,7 @@ def kv_inference(  # noqa: C901
                 tmp_token_list,
                 *atten_mask,
                 inputs_embeds,
+                tmp_position_ids,
                 tmp_pos,
                 *k_caches,
                 *v_caches,
@@ -600,6 +621,17 @@ def kv_inference(  # noqa: C901
                 )
                 
                 inputs_embeds = tok_embeddings(tmp_token_list)
+                
+                # Prepare tmp_position_ids (padded with zeros).
+                tmp_position_ids = torch.zeros((3, 1, ar_len), dtype=torch.int32)
+                for i in range(3):
+                    start_pos = chunk_start_idx
+                    tmp_position_ids[i, 0, :num_tokens_in_chunk] = torch.arange(
+                        start=start_pos,
+                        end=start_pos + num_tokens_in_chunk,
+                        step=1,
+                        dtype=torch.int32,
+                    )
 
                 # Prepare tmp_pos (padded with zeros).
                 tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
@@ -611,6 +643,7 @@ def kv_inference(  # noqa: C901
                     tmp_token_list,
                     *atten_mask,
                     inputs_embeds,
+                    tmp_position_ids,
                     tmp_pos,
                     *k_caches,
                     *v_caches,
@@ -725,7 +758,7 @@ def prefill_inference(
     use_i64_token=False,
     collect_logits=False,
 ):
-    _, atten_mask, _ = get_example_inputs(use_kv_cache=False)
+    _, atten_mask, _, _ = get_example_inputs(use_kv_cache=False)
 
     # TODO: change criteria & support batch inputs if necessary
 

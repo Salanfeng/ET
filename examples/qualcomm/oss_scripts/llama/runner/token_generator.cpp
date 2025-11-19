@@ -39,6 +39,7 @@ TokenGenerator<T>::TokenGenerator(
   input_toks_.size = metadata_.ar_len * sizeof(int64_t);
   inputs_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
   input_pos_.size = metadata_.ar_len * sizeof(int32_t);
+  position_ids_.size = 3 * metadata_.context_len * sizeof(uint16_t);
   attention_mask_.size =
       metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
 
@@ -110,6 +111,20 @@ void TokenGenerator<T>::init_io(
   input_tensors_.emplace_back(inputs_embeds_.tensor.get());
   buffer_manager->add_memory_info(
       inputs_embeds_.data, inputs_embeds_.size, inputs_embeds.get());
+
+  // [I]: position_ids
+  Result<TensorInfo> position_ids = method_meta->input_tensor_meta(idx++);
+  position_ids_.data = reinterpret_cast<uint16_t*>(
+      buffer_manager->allocate(position_ids_.size));
+  position_ids_.tensor = std::make_unique<TensorImpl>(
+      position_ids->scalar_type(),
+      position_ids->sizes().size(),
+      const_cast<TensorImpl::SizesType*>(position_ids->sizes().data()),
+      position_ids_.data,
+      const_cast<TensorImpl::DimOrderType*>(position_ids->dim_order().data()));
+  input_tensors_.emplace_back(position_ids_.tensor.get());
+  buffer_manager->add_memory_info(
+      position_ids_.data, position_ids_.size, position_ids.get());
 
   // [I]: sliding window attention_mask
   if (metadata_.cache_mode == CacheMode::HybridCache) {
@@ -226,17 +241,22 @@ const std::vector<uint16_t>& TokenGenerator<T>::get_all_logits() {
 
 // This function only considers the case where token_generator_ar_len equals 1.
 template <typename T>
-void TokenGenerator<T>::prepare_io(uint64_t cur_token, int64_t start_pos) {
+void TokenGenerator<T>::prepare_io(uint64_t cur_token, int64_t start_pos, const std::vector<uint16_t>& all_position_ids) {
   // update input_tok
   *input_toks_.data =
       metadata_.use_int64_token ? cur_token : static_cast<int32_t>(cur_token);
   // update position_ids
   *input_pos_.data = static_cast<int32_t>(start_pos);
+  // update all_position_ids
+  for (int i = 0; i < 3; i++) {
+    position_ids_.data[i] = all_position_ids[i * metadata_.context_len + start_pos];
+  }
 }
 
 template <typename T>
 Result<int64_t> TokenGenerator<T>::generate(
     std::vector<uint64_t> tokens,
+    std::vector<uint16_t> all_position_ids,
     int64_t start_pos,
     int32_t seq_len,
     std::function<void(const std::string&)> token_callback,
@@ -275,7 +295,7 @@ Result<int64_t> TokenGenerator<T>::generate(
   // Generate our tokens
   while (pos < seq_len - 1) {
     // Fill in the token and position data
-    prepare_io(cur_token, pos);
+    prepare_io(cur_token, pos, all_position_ids);
     // Only update data pointer of the cache to the tensor for SHIFT_POINTER
     // mode
     bool updated = kv_manager_->update_cache_tensor(
@@ -308,6 +328,7 @@ Result<int64_t> TokenGenerator<T>::generate(
     prev_token = cur_token;
 
     stats_->on_sampling_begin();
+    // ET_LOG(Info, "Token Generator: Current token at position %d is %lu", pos, cur_token);
     cur_token =
         decoder_runner_->logits_to_token(logits_tensor, metadata_.ar_len);
     stats_->on_sampling_end();

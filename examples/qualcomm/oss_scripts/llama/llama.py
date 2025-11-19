@@ -143,9 +143,10 @@ class SingleLlama:
             inputs[0],  # tokens
             *inputs[1],  # attn_mask
             inputs[2],  # input_embeds
-            *((inputs[3],) if self.llama_meta["get_use_kv_cache"] else []),  # pos_ids
-            *(inputs[4] if self.llama_meta["get_use_kv_cache"] else []),  # k_caches
-            *(inputs[5] if self.llama_meta["get_use_kv_cache"] else []),  # v_caches
+            inputs[3], # position_ids
+            *((inputs[4],) if self.llama_meta["get_use_kv_cache"] else []),  # pos_ids
+            *(inputs[5] if self.llama_meta["get_use_kv_cache"] else []),  # k_caches
+            *(inputs[6] if self.llama_meta["get_use_kv_cache"] else []),  # v_caches
         )
         self.llama_graph_module = decoder_model
         self.io_shape = {
@@ -191,7 +192,7 @@ class SingleLlama:
 
         if node.op == "placeholder":
             if (
-                len(users := list(node.users)) == 1
+                len(users := list(node.users)) == 1 and hasattr(users[0].meta["val"], "size")
                 and users[0].meta["val"].size()[-2:] in kv_cache_shape
             ):
                 quant_io_type = fixed_point_type["kv_type"]
@@ -227,6 +228,21 @@ class SingleLlama:
         chat_template=None,
         lookahead_config=None,
     ):
+        
+        graph_module_inference(
+            use_kv_cache=self.llama_meta["get_use_kv_cache"],
+            get_example_inputs=self.get_example_inputs,
+            module=self.llama_graph_module,
+            tokenizer=tokenizer,
+            tok_embeddings=self.tok_embeddings,
+            ar_len=self.llama_meta["get_ar_len"],
+            max_seq_len=self.llama_meta["get_max_seq_len"],
+            kv_updater=args.kv_updater,
+            prompt="start",
+            num_fewshot=args.num_fewshot,
+            use_i64_token=args.embedding_quantize is not None,
+            event_name="testing",
+        )
         self.quant_dtype = quant_dtype
         quantizer = make_custom_quantizer(
             quant_dtype, args.range_setting, custom_annotations
@@ -339,20 +355,20 @@ class SingleLlama:
             if chat_template and args.decoder_model in {"gemma-2b", "gemma3-1b"}:
                 prompt = prompt.replace("<bos>", "")
 
-            graph_module_inference(
-                use_kv_cache=self.llama_meta["get_use_kv_cache"],
-                get_example_inputs=self.get_example_inputs,
-                module=self.llama_graph_module,
-                tokenizer=tokenizer,
-                tok_embeddings=self.tok_embeddings,
-                ar_len=self.llama_meta["get_ar_len"],
-                max_seq_len=self.llama_meta["get_max_seq_len"],
-                kv_updater=args.kv_updater,
-                prompt=prompt,
-                use_i64_token=args.embedding_quantize is not None,
-                event_name="convert_pt2e_prompt",
-                lookahead_config=lookahead_config,
-            )
+        graph_module_inference(
+            use_kv_cache=self.llama_meta["get_use_kv_cache"],
+            get_example_inputs=self.get_example_inputs,
+            module=self.llama_graph_module,
+            tokenizer=tokenizer,
+            tok_embeddings=self.tok_embeddings,
+            ar_len=self.llama_meta["get_ar_len"],
+            max_seq_len=self.llama_meta["get_max_seq_len"],
+            kv_updater=args.kv_updater,
+            prompt="start",
+            use_i64_token=args.embedding_quantize is not None,
+            event_name="convert_pt2e_prompt",
+            lookahead_config=lookahead_config,
+        )
 
     def save_logits_quant_attrs(self):
         for node in self.llama_graph_module.graph.nodes:
@@ -364,6 +380,13 @@ class SingleLlama:
                     ):
                         source_node = output_node.args[0].args[0]
                         if source_node.meta["val"].size() in self.io_shape:
+                            self.llama_meta["get_logits_scale"] = output_node.args[1]
+                            self.llama_meta["get_logits_zero_point"] = output_node.args[
+                                2
+                            ]
+                            break
+                        else:
+                            stop = input("Unexpected output node found when saving logits quant attrs, continue? (y/n)")
                             self.llama_meta["get_logits_scale"] = output_node.args[1]
                             self.llama_meta["get_logits_zero_point"] = output_node.args[
                                 2
@@ -645,7 +668,7 @@ def compile(
             model = llama_instance_list[1]
             model.to(torch.float)
             ar_len, model.ar_len = model.ar_len, model.max_seq_len
-            tokens, atten_mask = model.get_example_inputs(use_kv_cache=False)
+            tokens, atten_mask, _, _ = model.get_example_inputs(use_kv_cache=False)
             atten_mask.mask.to(torch.float)
             wrapped_model = WrappedLlamaModel(
                 model,
@@ -719,12 +742,8 @@ def compile(
         start_quantize_ts = time.time()
         custom_annotations = decoder_model_config.custom_annotation
         kv_quant_attrs = {}
-        for i, llama_instance in enumerate(llama_instance_list):
-            lookahead_config = (
-                (args.window, args.ngram, args.gcap)
-                if i == 0 and args.model_mode == "lookahead"
-                else None
-            )
+        for i, llama_instance in enumerate(reversed(llama_instance_list)): #慎用 reversed
+            lookahead_config = None
             llama_instance.quantize(
                 quant_dtype=quant_dtype,
                 args=args,
@@ -735,7 +754,7 @@ def compile(
                 lookahead_config=lookahead_config,
             )
             # If hybrid and lookahead mode, we store kv output quant_attrs and apply to prefill output quant_attrs later
-            if i == 0 and args.model_mode in ["hybrid", "lookahead"]:
+            if i == 1 and args.model_mode in ["hybrid", "lookahead"]:
                 output_indices = 0
                 for node in llama_instance.llama_graph_module.graph.nodes:
                     if node.op == "output":
@@ -1022,10 +1041,12 @@ def inference(
                 "--output_path outputs/outputs.txt",
                 f"--performance_output_path {performance_output_path}",
                 f"--kv_updater {'SmartMask' if args.kv_updater == smart_mask_updater else 'ShiftPointer'}",
+                f"--embeds_path inputs_embeds.bin",
                 runner_args,
             ]
         )
 
+        logging.info(f"Runner command: {runner_cmd}")
         adb = SimpleADB(
             qnn_sdk=os.getenv("QNN_SDK_ROOT"),
             build_path=f"{args.build_folder}",
@@ -1162,7 +1183,7 @@ def _build_parser():
     parser.add_argument(
         "--temperature",
         help="Sampling temperature for llama.",
-        default=0.8,
+        default=0,
         type=float,
     )
 
@@ -1373,14 +1394,7 @@ def export_llama(args) -> None:
 def main():
     parser = _build_parser()
     args = parser.parse_args()
-    try:
-        export_llama(args)
-    except Exception as e:
-        if args.ip and args.port != -1:
-            with Client((args.ip, args.port)) as conn:
-                conn.send(json.dumps({"Error": str(e)}))
-        else:
-            raise Exception(e)
+    export_llama(args)
 
 
 # flake8: noqa: C901

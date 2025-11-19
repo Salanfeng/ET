@@ -97,6 +97,7 @@ class LhdTokenGenerator : public TokenGenerator<T> {
      */
   executorch::runtime::Result<int64_t> generate(
       std::vector<uint64_t> tokens,
+      std::vector<uint16_t> all_position_ids,
       int64_t start_pos,
       int32_t seq_len,
       std::function<void(const std::string&)> token_callback,

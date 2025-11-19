@@ -32,6 +32,7 @@ PromptProcessor<T>::PromptProcessor(
   // Calculate I/O size
   input_toks_.size = metadata_.ar_len * sizeof(int64_t);
   inputs_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
+  position_ids_.size = 3 * metadata_.context_len * sizeof(uint16_t);//3 * metadata_.ar_len * sizeof(uint16_t);
   if (is_bert())
     input_pos_.size = 0;
   else
@@ -105,6 +106,20 @@ void PromptProcessor<T>::init_io(
   input_tensors_.emplace_back(inputs_embeds_.tensor.get());
   buffer_manager->add_memory_info(
       inputs_embeds_.data, inputs_embeds_.size, inputs_embeds.get());
+
+  // [I]: position_ids
+  Result<TensorInfo> position_ids = method_meta->input_tensor_meta(idx++);
+  position_ids_.data = reinterpret_cast<uint16_t*>(
+      buffer_manager->allocate(position_ids_.size));
+  position_ids_.tensor = std::make_unique<TensorImpl>(
+      position_ids->scalar_type(),
+      position_ids->sizes().size(),
+      const_cast<TensorImpl::SizesType*>(position_ids->sizes().data()),
+      position_ids_.data,
+      const_cast<TensorImpl::DimOrderType*>(position_ids->dim_order().data()));
+  input_tensors_.emplace_back(position_ids_.tensor.get());
+  buffer_manager->add_memory_info(
+      position_ids_.data, position_ids_.size, position_ids.get());
 
   // [I]: sliding window attention_mask
   if (metadata_.cache_mode == CacheMode::HybridCache) {
@@ -225,6 +240,7 @@ template <typename T>
 void PromptProcessor<T>::prepare_io(
     const std::vector<uint64_t>& prompt_tokens,
     const std::vector<uint16_t>& inputs_embeds,
+    const std::vector<uint16_t>& all_position_ids,
     int64_t prompt_pos,
     int64_t start_pos) {
   for (int i = 0; i < metadata_.ar_len; i++) {
@@ -245,6 +261,7 @@ void PromptProcessor<T>::prepare_io(
         input_toks_ptr[i] = static_cast<int32_t>(prompt_tokens[prompt_pos + i]);
       }
     }
+    // TODO: 优化inputs_embeds的拷贝效率
     if (inputs_embeds.size() / metadata_.hidden_size > prompt_pos + i) {
       // copy the line of inputs_embeds to the input_embeds tensor
       std::memcpy(
@@ -253,12 +270,24 @@ void PromptProcessor<T>::prepare_io(
           metadata_.hidden_size * sizeof(uint16_t));
     }
   }
+
+  // ET_LOG(Info, "Preparing position_ids from all_position_ids with context_len: %d, ar_len: %d, start_pos: %d", metadata_.context_len, metadata_.ar_len, start_pos);
+  if (!all_position_ids.empty()) {
+    for (int i = 0; i < 3; i++) {
+      std::memcpy(
+          position_ids_.data + i * metadata_.ar_len,
+          all_position_ids.data() + i * metadata_.context_len + start_pos,
+          metadata_.ar_len * sizeof(uint16_t));
+    }
+  }
+    
 }
 
 template <typename T>
 Result<uint64_t> PromptProcessor<T>::prefill(
     std::vector<uint64_t> prompt_tokens,
     std::vector<uint16_t> inputs_embeds,
+    std::vector<uint16_t> all_position_ids,
     int64_t start_pos,
     bool dump_logits) {
   ET_CHECK_MSG(!prompt_tokens.empty() || !inputs_embeds.empty(), "Prompt cannot be null");
@@ -318,7 +347,7 @@ Result<uint64_t> PromptProcessor<T>::prefill(
       method_name_.c_str());
   for (int i = 0; i < num_iters; ++i) {
     // Fill in the token and position data
-    prepare_io(prompt_tokens, inputs_embeds, prompt_pos, pos);
+    prepare_io(prompt_tokens, inputs_embeds, all_position_ids, prompt_pos, pos);
     // Only update data pointer of the cache to the tensor for SHIFT_POINTER
     // mode
     bool updated = kv_manager_->update_cache_tensor(
@@ -363,6 +392,10 @@ Result<uint64_t> PromptProcessor<T>::prefill(
           n_update,
           metadata_.sliding_window);
     }
+    // for (int j = 0; j < n_update; j++) {
+    //   ET_LOG(Info, "Prompt Processor: processed token %d", prompt_pos + j);
+    //   decoder_runner_->logits_to_token(output_tensors_[0], j);
+    // }
     prompt_pos += metadata_.ar_len;
     pos += metadata_.ar_len;
   }
