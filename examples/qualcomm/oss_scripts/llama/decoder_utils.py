@@ -64,6 +64,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
         kv_updater: Callable,
         use_i64_token: bool,
         seq_mse_candidates: int,
+        is_vl_model: bool = False,
     ):
         # n seq len = n-1 cache len, so we len(inps) = n-1 during _model_call
         assert max_seq_length is not None, "max_seq_length must be provided"
@@ -79,6 +80,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
         self.use_i64_token = use_i64_token
         self.seq_mse_candidates = seq_mse_candidates
         self.tok_embeddings = tok_embeddings
+        self.is_vl_model = is_vl_model
 
     def _model_call(self, inps):
         all_logits = None
@@ -97,6 +99,7 @@ class GraphModuleCalibrationWrapper(EagerEvalWrapper):
             max_seq_len=self.max_seq_length,
             use_i64_token=self.use_i64_token,
             collect_logits=True,
+            is_vl_model=self.is_vl_model,
             **kwargs,
         )
         # one shot is enough for seq mse
@@ -481,6 +484,8 @@ def shift_pointer_updater(
     pos += n_updates
     return pos, k_caches, v_caches
 
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
 
 @register_inference(use_kv_cache=True)
 def kv_inference(  # noqa: C901
@@ -496,7 +501,12 @@ def kv_inference(  # noqa: C901
     collect_logits=False,
     seq_mse_candidates=0,
     lookahead_config=None,
+    is_vl_model=False,
 ):
+    
+    if prompt.startswith("start"):
+        is_vl_model = True
+        
     _, atten_mask, _, position_ids, _, k_caches, v_caches = get_example_inputs(use_kv_cache=True)
 
     # TODO: change criteria & support batch inputs if necessary
@@ -514,19 +524,63 @@ def kv_inference(  # noqa: C901
             )
         else:
             raise RuntimeError("Unknown tokenizer")
-        if prompt.startswith("start"):
-            prompt_token_list = [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 785, 24456, 8500, 1356, 23113, 4119, 525, 3118, 389, 6351, 64074, 476, 55712, 278, 29728, 14155, 429, 2924, 458, 23668, 323, 264, 24551, 13, 576, 1850, 16380, 4119, 1083, 4564, 279, 23668, 323, 24551, 1526, 458, 6529, 16953, 13, 1205, 29614, 264, 501, 4285, 3922, 17646, 11, 279, 62379, 11, 3118, 21063, 389, 6529, 23783, 11, 35593, 287, 448, 75193, 323, 5686, 20201, 11368, 13, 151645, 198, 151644, 77091, 198]
     else:
         # pyre-ignore
         prompt_token_list = prompt.flatten().tolist()
     total_token_list = prompt_token_list
     dtype = torch.int64 if use_i64_token else torch.int32
-
     position_ids = torch.zeros((3, 1, max_seq_len), dtype=torch.int32)
     for i in range(3):
         position_ids[i] = torch.arange(
             start=0, end=max_seq_len, step=1, dtype=torch.int32
         ).unsqueeze(0).repeat(1, 1)
+    
+    if is_vl_model:
+        model_dir = "/home/syf/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3"
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_dir, torch_dtype="auto", device_map="auto"
+        )
+        processor = AutoProcessor.from_pretrained(
+            model_dir, use_fast=True
+        )
+        
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": "/home/syf/executorch/examples/qualcomm/oss_scripts/llama/assets/robot.png",
+                    },
+                    {"type": "text", "text": "Describe the image."},
+                ],
+            }
+        ]
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        embeds = model.generate(**inputs, max_new_tokens=max_seq_len)
+        embeds = embeds.to(dtype=torch.float32)
+        
+        total_token_list = inputs.data["input_ids"]
+        image_grid_thw = inputs.data["image_grid_thw"]
+        tmp_position_ids = qwen2_5_get_rope_index(
+            total_token_list,
+            image_grid_thw
+        )
+        total_token_list = total_token_list.tolist()[0]
+        prompt_token_list = total_token_list
+
+        position_ids[:, :, : tmp_position_ids.size(-1)] = tmp_position_ids
+        
 
     with torch.no_grad():
         # Phase 1: Prefill the prompt in ar_len chunks.
@@ -546,15 +600,12 @@ def kv_inference(  # noqa: C901
             )
             
             inputs_embeds = tok_embeddings(tmp_token_list)
+            if is_vl_model:
+                inputs_embeds[:, :num_tokens_in_chunk, :] = embeds[:, pos : pos + num_tokens_in_chunk, :]
             
             tmp_position_ids = torch.zeros((3, 1, ar_len), dtype=torch.int32)
             for i in range(3):
-                tmp_position_ids[i] = torch.arange(
-                    start=pos,
-                    end=pos + ar_len,
-                    step=1,
-                    dtype=torch.int32,
-                ).unsqueeze(0).repeat(1, 1)
+                tmp_position_ids[i, :, :num_tokens_in_chunk] = position_ids[i, :, pos : pos + num_tokens_in_chunk]
 
             # Prepare tmp_pos (padded with zeros).
             tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
@@ -621,8 +672,6 @@ def kv_inference(  # noqa: C901
                 )
                 
                 inputs_embeds = tok_embeddings(tmp_token_list)
-                
-                # Prepare tmp_position_ids (padded with zeros).
                 tmp_position_ids = torch.zeros((3, 1, ar_len), dtype=torch.int32)
                 for i in range(3):
                     start_pos = chunk_start_idx
@@ -757,6 +806,7 @@ def prefill_inference(
     max_seq_len=512,
     use_i64_token=False,
     collect_logits=False,
+    is_vl_model=False,
 ):
     _, atten_mask, _, _ = get_example_inputs(use_kv_cache=False)
 
@@ -824,6 +874,7 @@ def graph_module_inference(
     event_name: Optional[str] = None,
     seq_mse_candidates: int = 0,
     lookahead_config: Optional[Tuple[int]] = None,
+    is_vl_model: bool = False,
 ):
     """
     This function supports model execution from static nn.Module decoder model
@@ -850,6 +901,7 @@ def graph_module_inference(
             max_seq_len=max_seq_len,
             use_i64_token=use_i64_token,
             collect_logits=False,
+            is_vl_model=is_vl_model,
             **kwargs,
         )
     else:
@@ -864,6 +916,7 @@ def graph_module_inference(
             kv_updater=kv_updater,
             use_i64_token=use_i64_token,
             seq_mse_candidates=seq_mse_candidates,
+            is_vl_model=is_vl_model,
         )
         # Evaluate the model
         with torch.no_grad():
@@ -890,3 +943,91 @@ def apply_prompt_template(
     )
     logging.info(f"Prompt after applying template: {template_prompt}")
     return template_prompt
+
+
+
+def qwen2_5_get_rope_index(
+    input_ids: Optional[torch.LongTensor] = None,
+    image_grid_thw: Optional[torch.LongTensor] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    spatial_merge_size = 2
+    image_token_id = 151655
+    video_token_id = 151656
+    vision_start_token_id = 151652
+    total_input_ids = input_ids
+    attention_mask = torch.ones_like(total_input_ids)
+    position_ids = torch.ones(
+        3,
+        input_ids.shape[0],
+        input_ids.shape[1],
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    image_index, video_index = 0, 0
+    attention_mask = attention_mask.to(total_input_ids.device)
+    for i, input_ids in enumerate(total_input_ids):
+        input_ids = input_ids[attention_mask[i] == 1]
+        image_nums, video_nums = 0, 0
+        vision_start_indices = torch.argwhere(input_ids == vision_start_token_id).squeeze(1)
+        vision_tokens = input_ids[vision_start_indices + 1]
+        image_nums = (vision_tokens == image_token_id).sum()
+        video_nums = (vision_tokens == video_token_id).sum()
+        input_tokens = input_ids.tolist()
+        llm_pos_ids_list: list = []
+        st = 0
+        remain_images, remain_videos = image_nums, video_nums
+        for _ in range(image_nums + video_nums):
+            if image_token_id in input_tokens and remain_images > 0:
+                ed_image = input_tokens.index(image_token_id, st)
+            else:
+                ed_image = len(input_tokens) + 1
+            if video_token_id in input_tokens and remain_videos > 0:
+                ed_video = input_tokens.index(video_token_id, st)
+            else:
+                ed_video = len(input_tokens) + 1
+            if ed_image < ed_video:
+                t, h, w = (
+                    image_grid_thw[image_index][0],
+                    image_grid_thw[image_index][1],
+                    image_grid_thw[image_index][2],
+                )
+                second_per_grid_t = 0
+                image_index += 1
+                remain_images -= 1
+                ed = ed_image
+            llm_grid_t, llm_grid_h, llm_grid_w = (
+                t.item(),
+                h.item() // spatial_merge_size,
+                w.item() // spatial_merge_size,
+            )
+            text_len = ed - st
+
+            st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+            llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+            range_tensor = torch.arange(llm_grid_t).view(-1, 1)
+            expanded_range = range_tensor.expand(-1, llm_grid_h * llm_grid_w)
+
+            ## normalize type, send to device.
+            second_per_grid_t = torch.as_tensor(
+                second_per_grid_t, dtype=range_tensor.dtype, device=range_tensor.device
+            )
+
+            time_tensor = expanded_range * second_per_grid_t * 2
+
+            time_tensor_long = time_tensor.long()
+            t_index = time_tensor_long.flatten()
+
+            h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+            w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+            llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+            st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+
+        if st < len(input_tokens):
+            st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+            text_len = len(input_tokens) - st
+            llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+        llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+        position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
+    return position_ids

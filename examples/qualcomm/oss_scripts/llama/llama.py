@@ -228,7 +228,6 @@ class SingleLlama:
         chat_template=None,
         lookahead_config=None,
     ):
-        
         graph_module_inference(
             use_kv_cache=self.llama_meta["get_use_kv_cache"],
             get_example_inputs=self.get_example_inputs,
@@ -312,13 +311,16 @@ class SingleLlama:
             use_i64_token=args.embedding_quantize is not None,
             event_name="prepare_pt2e_prompt",
             lookahead_config=lookahead_config,
+            is_vl_model=True,
         )
+        logging.info("Finished calibration.")
         if scales_state_dict:
             set_scales(
                 fx_graph_module, scales_state_dict, self.llama_graph_module.head_dim
             )
 
         self.llama_graph_module = convert_pt2e(fx_graph_module)
+        logging.info("Finished converting to QDQ model.")
 
         if args.verbose:
             logging.info("Verifying the QDQ model...")
@@ -355,6 +357,8 @@ class SingleLlama:
             if chat_template and args.decoder_model in {"gemma-2b", "gemma3-1b"}:
                 prompt = prompt.replace("<bos>", "")
 
+        
+        logging.info("Verifying the QDQ model on user's prompt...")
         graph_module_inference(
             use_kv_cache=self.llama_meta["get_use_kv_cache"],
             get_example_inputs=self.get_example_inputs,
@@ -364,10 +368,11 @@ class SingleLlama:
             ar_len=self.llama_meta["get_ar_len"],
             max_seq_len=self.llama_meta["get_max_seq_len"],
             kv_updater=args.kv_updater,
-            prompt="start",
+            prompt=prompt,
             use_i64_token=args.embedding_quantize is not None,
             event_name="convert_pt2e_prompt",
             lookahead_config=lookahead_config,
+            is_vl_model=True,
         )
 
     def save_logits_quant_attrs(self):

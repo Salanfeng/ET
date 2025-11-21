@@ -65,8 +65,6 @@ def apply_partial_rotary_emb_single(
 def apply_multimodal_rotary_pos_emb_single(
     x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, mrope_section: List[int]
 ):
-    freqs_cos = freqs_cos.unsqueeze(0).expand(3, -1, -1)
-    freqs_sin = freqs_sin.unsqueeze(0).expand(3, -1, -1)
     # Rearrange cos/sin chunks: temporal, height, width -> repeat pattern
     cos = torch.cat([m[i % 3] for i, m in enumerate(freqs_cos.split(mrope_section, dim=-1))], dim=-1)
     sin = torch.cat([m[i % 3] for i, m in enumerate(freqs_sin.split(mrope_section, dim=-1))], dim=-1)
@@ -83,63 +81,23 @@ def apply_multimodal_rotary_pos_emb_single(
 
     return torch.cat([x_out_r, x_out_i], dim=-1)
 
-def compute_mrope_freqs(inv_freq: torch.Tensor, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute freqs_cos and freqs_sin for multimodal RoPE using an explicit outer product.
 
-    Inputs:
-      - inv_freq: 1D tensor of length half_dim (head_dim//2). Device/dtype will be used
-        for the computed freqs (position_ids will be moved to the same device).
-      - position_ids: can be one of:
-          (3, B, S) -> interpreted as (B, S, 3)
-          (B, S, 3) -> already (B, S, 3)
-          (B, S)   -> treated as (B, S, 1)
+def compute_mrope_freqs(
+    inv_freq: torch.Tensor, 
+    position_ids: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
 
-    Returns:
-      - freqs_cos, freqs_sin: tensors shaped (B, S, C * half_dim), where C is number of
-        channels (1 or 3).
-    """
-    if inv_freq.dim() != 1:
-        raise ValueError("inv_freq must be a 1D tensor of length head_dim//2")
-
-    pos = position_ids
-    # Normalize position_ids to shape (B, S, C)
-    if pos.dim() == 3 and pos.shape[0] == 3:
-        # (3, B, S) -> (B, S, 3)
-        pos = pos.permute(1, 2, 0)
-    elif pos.dim() == 3 and pos.shape[-1] == 3:
-        # already (B, S, 3)
-        pass
-    elif pos.dim() == 2:
-        # (B, S) -> (B, S, 1)
-        pos = pos.unsqueeze(-1)
-    else:
-        raise ValueError("position_ids must have shape (3,B,S) or (B,S,3) or (B,S)")
-
-    device = inv_freq.device
-    dtype = inv_freq.dtype
-    # Move pos to the same device as inv_freq. We'll perform outer on 1D views.
-    pos = pos.to(device=device)
-
-    batch, seq_len, n_chan = pos.shape
     half_dim = inv_freq.shape[0]
-
-    # Flatten positions to 1D, outer with inv_freq, then reshape back.
-    # pos_flat: (B*S*C,), inv_vec: (half_dim,)
-    pos_flat = pos.to(dtype=dtype).reshape(-1)
-    inv_vec = inv_freq.to(device=device, dtype=dtype).reshape(-1)
-
-    # Explicit outer product -> (B*S*C, half_dim)
-    freqs_flat = torch.outer(pos_flat, inv_vec).float()
-
-    # Reshape to (B, S, C, half_dim) then flatten last two dims -> (B, S, C*half_dim)
-    freqs = freqs_flat.view(batch, seq_len, n_chan, half_dim)
-    freqs = freqs.reshape(batch, seq_len, n_chan * half_dim)
-
-    freqs_cos = freqs.cos()
-    freqs_sin = freqs.sin()
-
-    return freqs_cos, freqs_sin
+    inv_freq_expanded = inv_freq.reshape(1, 1, half_dim, 1)
+    position_ids_expanded = position_ids.unsqueeze(2)
+    freqs = inv_freq_expanded * position_ids_expanded
+    freqs = freqs.transpose(2, 3)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos()
+    sin = emb.sin()
+    cos = cos[:, :, :, : cos.shape[-1] // 2]
+    sin = sin[:, :, :, : sin.shape[-1] // 2]
+    return cos, sin
 
 class LlamaAttention(nn.Module):
     def __init__(self, layer_idx: int, config: ModelArgs, output_new_cache_only=False):
@@ -169,8 +127,8 @@ class LlamaAttention(nn.Module):
 
         if config.partial_rotary_factor < 1:
             self.apply_rope_emb = apply_partial_rotary_emb_single
-        # elif config.use_mrope:
-        #     self.apply_rope_emb = partial(apply_multimodal_rotary_pos_emb_single, mrope_section=config.mrope_section)
+        elif config.use_mrope:
+            self.apply_rope_emb = partial(apply_multimodal_rotary_pos_emb_single, mrope_section=config.mrope_section)
         else:
             self.apply_rope_emb = apply_rotary_emb_single
 
@@ -627,7 +585,6 @@ class LlamaModel(nn.Module):
 
         output_k_cache = []
         output_v_cache = []
-        position_ids = None
         # following tensors should be invariant across batches
         if position_ids is not None and hasattr(self, "inv_freq") and self.inv_freq.dim() == 1 and position_ids.dim() >= 2:
             # Use the helper we added to compute cos/sin from inv_freq and position_ids
