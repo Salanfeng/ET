@@ -89,7 +89,7 @@ def compute_mrope_freqs(
 
     half_dim = inv_freq.shape[0]
     inv_freq_expanded = inv_freq.reshape(1, 1, half_dim, 1)
-    position_ids_expanded = position_ids.unsqueeze(2)
+    position_ids_expanded = position_ids.unsqueeze(2).to(dtype=inv_freq_expanded.dtype)
     freqs = inv_freq_expanded * position_ids_expanded
     freqs = freqs.transpose(2, 3)
     emb = torch.cat((freqs, freqs), dim=-1)
@@ -585,19 +585,9 @@ class LlamaModel(nn.Module):
 
         output_k_cache = []
         output_v_cache = []
-        # following tensors should be invariant across batches
-        if position_ids is not None and hasattr(self, "inv_freq") and self.inv_freq.dim() == 1 and position_ids.dim() >= 2:
-            # Use the helper we added to compute cos/sin from inv_freq and position_ids
-            freqs_cos, freqs_sin = compute_mrope_freqs(self.inv_freq, position_ids)
-        else:
-            # Fallback: keep previous semantics (supporting use_kv_cache)
-            freqs_cos = (
-                self.freqs_cos[input_pos][0] if self.use_kv_cache and input_pos is not None else self.freqs_cos
-            )
-            freqs_sin = (
-                self.freqs_sin[input_pos][0] if self.use_kv_cache and input_pos is not None else self.freqs_sin
-            )
-
+        
+        freqs_cos, freqs_sin = compute_mrope_freqs(self.inv_freq, position_ids)
+        
         if self.use_embeds:
             hidden_states = inputs_embeds
         else:
