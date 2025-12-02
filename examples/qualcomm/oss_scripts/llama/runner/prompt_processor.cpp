@@ -269,6 +269,10 @@ void PromptProcessor<T>::prepare_io(
           inputs_embeds_.data + i * metadata_.hidden_size,
           inputs_embeds.data() + (prompt_pos + i) * metadata_.hidden_size,
           metadata_.hidden_size * sizeof(uint16_t));
+      // print first 10 elements for debug
+      // for (int j = 0; j < 10; j++) {
+      //   ET_LOG(Info, "inputs_embeds[%d][%d] = %u", i, j, inputs_embeds_.data[i * metadata_.hidden_size + j]);
+      // }
     }
   }
 
@@ -279,6 +283,10 @@ void PromptProcessor<T>::prepare_io(
           position_ids_.data + i * metadata_.ar_len,
           all_position_ids.data() + i * n_token + start_pos,
           std::min(static_cast<size_t>(metadata_.ar_len),static_cast<size_t>(n_token - start_pos)) * sizeof(int32_t));
+          // print frist 10 position ids for debug
+          // for (int j = 0; j < std::min(20, metadata_.ar_len); j++) {
+          //   ET_LOG(Info, "position_ids[%d][%d] = %d", i, j, position_ids_.data[i * metadata_.ar_len + j]);
+          // }
     }
   }
 }

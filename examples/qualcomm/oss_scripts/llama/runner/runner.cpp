@@ -72,21 +72,26 @@ void parse_mtmd(const std::string& path,
         position_ids[i] = tmp_position_ids[i];
     }
 
+  
     // // 打印前3个token的样例
-    // std::cout << "\nEmbeddings (前3个token的前8维):\n";
+    // ET_LOG(Info, "\nEmbeddings (前3个token的前8维):\n");
     // for (int i = 0; i < std::min(3u, header.n_tokens); ++i) {
-    //     std::cout << "  Token " << i << ": ";
+    //     ET_LOG(Info, "Token %d: ", i);
     //     for (int j = 0; j < std::min(8u, header.n_embd_dims); ++j) {
-    //         std::cout << embeddings[i * header.n_embd_dims + j] << " ";
+    //         ET_LOG(Info, "%f ", embeddings[i * header.n_embd_dims + j]);
     //     }
-    //     std::cout << "...\n";
+    //     ET_LOG(Info, "...\n");
     // }
 
-    // std::cout << "\nPosition IDs:\n";
-    // for (int i = 0; i < std::min(10u, (uint32_t)position_ids.size()); ++i) {
-    //     std::cout << position_ids[i] << " ";
+    // ET_LOG(Info, "\nPosition IDs:\n");
+    // for (int i = 0; i < std::min(3u, header.n_pos_dims); ++i) {
+    //     ET_LOG(Info, "Dimension: %d: ", i);
+    //     for (int j = 0; j < std::min(16u, header.n_tokens); ++j) {
+    //         ET_LOG(Info, "%d ", position_ids[i * header.n_tokens + j]);
+    //     }
+    //     ET_LOG(Info, "...\n");
     // }
-    // std::cout << (position_ids.size() > 10 ? "...\n" : "\n");
+    // ET_LOG(Info, (position_ids.size() > 10 ? "...\n" : "\n"));
     file.close();
 }
 
@@ -494,11 +499,11 @@ Error Runner<T>::generate_from_prompt_or_file(
             std::round(input_embeds_tmp[i] / logits_scale_) + logits_zero_point_);
         quantized_value = std::max(0, std::min(65535, quantized_value));
         input_embeds[i] = static_cast<uint16_t>(quantized_value);
-        // if (i < 2048) {
-        //   ET_LOG(Info, "input_embeds[%zu]: float=%f quantized=%u", i, input_embeds_tmp[i], input_embeds[i]);
+        // 每行2048个，打印每行前10个
+        // if (i % 2048 < 10) {
+        //   ET_LOG(Info, "input_embeds[%ld]: %f -> %u", i, input_embeds_tmp[i], input_embeds[i]);
         // }
       }
-      
   } else {
     tokenizers::Result<std::vector<uint64_t>> encode_res =
         tokenizer_->encode(prompt, n_bos, 0);
@@ -508,6 +513,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   }
   int num_prompt_tokens = embeds? input_embeds.size() / 2048 : prompt_tokens.size(); //TODO
   ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
+  ET_LOG(Info, "num_prompt_tokens=%d seq_len=%d", num_prompt_tokens, seq_len);
   ET_CHECK_MSG(
       cur_pos_ + num_prompt_tokens < seq_len,
       "sequence length exceeded - please increase the seq_len value");
