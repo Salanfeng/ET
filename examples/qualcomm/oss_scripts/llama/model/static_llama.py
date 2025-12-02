@@ -65,6 +65,8 @@ def apply_partial_rotary_emb_single(
 def apply_multimodal_rotary_pos_emb_single(
     x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor, mrope_section: List[int]
 ):
+    # freqs_cos = freqs_cos.unsqueeze(0).expand(3, -1, -1)
+    # freqs_sin = freqs_sin.unsqueeze(0).expand(3, -1, -1)
     # Rearrange cos/sin chunks: temporal, height, width -> repeat pattern
     cos = torch.cat([m[i % 3] for i, m in enumerate(freqs_cos.split(mrope_section, dim=-1))], dim=-1)
     sin = torch.cat([m[i % 3] for i, m in enumerate(freqs_sin.split(mrope_section, dim=-1))], dim=-1)

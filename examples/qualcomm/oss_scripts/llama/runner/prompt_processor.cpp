@@ -32,7 +32,7 @@ PromptProcessor<T>::PromptProcessor(
   // Calculate I/O size
   input_toks_.size = metadata_.ar_len * sizeof(int64_t);
   inputs_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
-  position_ids_.size = 3 * metadata_.context_len * sizeof(uint16_t);//3 * metadata_.ar_len * sizeof(uint16_t);
+  position_ids_.size = 3 * metadata_.ar_len * sizeof(int32_t);
   if (is_bert())
     input_pos_.size = 0;
   else
@@ -240,9 +240,10 @@ template <typename T>
 void PromptProcessor<T>::prepare_io(
     const std::vector<uint64_t>& prompt_tokens,
     const std::vector<uint16_t>& inputs_embeds,
-    const std::vector<uint16_t>& all_position_ids,
+    const std::vector<int32_t>& all_position_ids,
     int64_t prompt_pos,
     int64_t start_pos) {
+  uint32_t n_token = inputs_embeds.size() / metadata_.hidden_size;
   for (int i = 0; i < metadata_.ar_len; i++) {
     if (!is_bert()) {
       // Prepare pos data
@@ -276,18 +277,17 @@ void PromptProcessor<T>::prepare_io(
     for (int i = 0; i < 3; i++) {
       std::memcpy(
           position_ids_.data + i * metadata_.ar_len,
-          all_position_ids.data() + i * metadata_.context_len + start_pos,
-          metadata_.ar_len * sizeof(uint16_t));
+          all_position_ids.data() + i * n_token + start_pos,
+          std::min(static_cast<size_t>(metadata_.ar_len),static_cast<size_t>(n_token - start_pos)) * sizeof(int32_t));
     }
   }
-    
 }
 
 template <typename T>
 Result<uint64_t> PromptProcessor<T>::prefill(
     std::vector<uint64_t> prompt_tokens,
     std::vector<uint16_t> inputs_embeds,
-    std::vector<uint16_t> all_position_ids,
+    std::vector<int32_t> all_position_ids,
     int64_t start_pos,
     bool dump_logits) {
   ET_CHECK_MSG(!prompt_tokens.empty() || !inputs_embeds.empty(), "Prompt cannot be null");

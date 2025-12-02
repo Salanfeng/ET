@@ -46,6 +46,22 @@ enum KvBitWidth {
   kWidth16 = 16,
 };
 
+struct mtmd_binary_header {
+    char     magic[4];
+    uint32_t version;
+    uint32_t n_tokens;
+    uint32_t n_embd_dims;
+    uint32_t n_pos_dims;
+    uint32_t embd_type;
+    uint32_t pos_type;
+    uint32_t reserved[5];
+};
+
+enum ggml_type {
+    GGML_TYPE_F32  = 0,
+    GGML_TYPE_I32  = 26,
+};
+
 template <typename T>
 class Runner : public executorch::extension::llm::IRunner {
  public:

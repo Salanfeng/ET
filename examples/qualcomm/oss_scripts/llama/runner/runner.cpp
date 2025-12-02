@@ -38,22 +38,6 @@ namespace llm = ::executorch::extension::llm;
 namespace example {
 namespace {
 
-struct mtmd_binary_header {
-    char     magic[4];
-    uint32_t version;
-    uint32_t n_tokens;
-    uint32_t n_embd_dims;
-    uint32_t n_pos_dims;
-    uint32_t embd_type;
-    uint32_t pos_type;
-    uint32_t reserved[5];
-};
-
-enum ggml_type {
-    GGML_TYPE_F32  = 0,
-    GGML_TYPE_I32  = 26,
-};
-
 size_t ggml_type_size(uint32_t type) {
     switch (type) {
         case GGML_TYPE_F32: return 4;
@@ -64,7 +48,7 @@ size_t ggml_type_size(uint32_t type) {
 
 void parse_mtmd(const std::string& path,
                  std::vector<float>& embeddings,
-                 std::vector<uint16_t>& position_ids) {
+                 std::vector<int32_t>& position_ids) {
     std::ifstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("无法打开文件");
 
@@ -81,10 +65,11 @@ void parse_mtmd(const std::string& path,
     // 读取position数据
     size_t pos_size = header.n_tokens * header.n_pos_dims * ggml_type_size(header.pos_type);
     std::vector<int32_t> tmp_position_ids(header.n_tokens * header.n_pos_dims);
+    ET_LOG(Info, "Position IDs n_tokens: %d, n_pos_dims: %d", header.n_tokens, header.n_pos_dims);
     position_ids.resize(header.n_tokens * header.n_pos_dims);
     file.read(reinterpret_cast<char*>(tmp_position_ids.data()), pos_size);
     for (size_t i = 0; i < tmp_position_ids.size(); ++i) {
-        position_ids[i] = static_cast<uint16_t>(tmp_position_ids[i]);
+        position_ids[i] = tmp_position_ids[i];
     }
 
     // // 打印前3个token的样例
@@ -439,7 +424,7 @@ Error Runner<T>::generate_from_prompt_or_file(
     std::function<void(const Stats&)> stats_callback) {
 
   std::vector<uint16_t> input_embeds(0);
-  std::vector<uint16_t> all_position_ids(0);
+  std::vector<int32_t> all_position_ids(0);
 
   ET_CHECK_MSG(!prompt.empty() || !input_embeds.empty(), "prompt cannot be null");
   if (!is_loaded()) {
@@ -556,7 +541,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   // start the main loop
   prompt_tokens.push_back(cur_token);
   int64_t num_generated_tokens = ET_UNWRAP(token_generator_->generate(
-      prompt_tokens, all_position_ids, cur_pos_, seq_len, token_callback, dump_logits));
+      prompt_tokens, cur_pos_, seq_len, token_callback, dump_logits));
   stats_.inference_end_ms = time_in_ms();
   ET_LOG(
       Info,

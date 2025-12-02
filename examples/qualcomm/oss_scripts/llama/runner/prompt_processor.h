@@ -70,7 +70,7 @@ class PromptProcessor {
   executorch::runtime::Result<uint64_t> prefill(
       std::vector<uint64_t> prompt_tokens,
       std::vector<uint16_t> inputs_embeds,
-      std::vector<uint16_t> all_position_ids,
+      std::vector<int32_t> all_position_ids,
       int64_t start_pos,
       bool dump_logits);
   /**
@@ -102,7 +102,7 @@ class PromptProcessor {
   void prepare_io(
       const std::vector<uint64_t>& prompt_tokens,
       const std::vector<uint16_t>& inputs_embeds,
-      const std::vector<uint16_t>& all_position_ids,
+      const std::vector<int32_t>& all_position_ids,
       int64_t prompt_pos,
       int64_t start_pos);
   DecoderRunner* decoder_runner_;
@@ -115,7 +115,7 @@ class PromptProcessor {
   // inputs and outputs
   TensorStruct<int64_t> input_toks_;
   TensorStruct<uint16_t> inputs_embeds_;  // For vision-language models
-  TensorStruct<uint16_t> position_ids_;
+  TensorStruct<int32_t> position_ids_;
   TensorStruct<int32_t> input_pos_;
   TensorStruct<uint16_t> attention_mask_;
   TensorStruct<uint16_t> window_attention_mask_;

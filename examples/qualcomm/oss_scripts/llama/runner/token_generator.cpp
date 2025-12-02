@@ -39,7 +39,7 @@ TokenGenerator<T>::TokenGenerator(
   input_toks_.size = metadata_.ar_len * sizeof(int64_t);
   inputs_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
   input_pos_.size = metadata_.ar_len * sizeof(int32_t);
-  position_ids_.size = 3 * metadata_.context_len * sizeof(uint16_t);
+  position_ids_.size = 3 * metadata_.ar_len * sizeof(int32_t);
   attention_mask_.size =
       metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
 
@@ -241,22 +241,20 @@ const std::vector<uint16_t>& TokenGenerator<T>::get_all_logits() {
 
 // This function only considers the case where token_generator_ar_len equals 1.
 template <typename T>
-void TokenGenerator<T>::prepare_io(uint64_t cur_token, int64_t start_pos, const std::vector<uint16_t>& all_position_ids) {
+void TokenGenerator<T>::prepare_io(uint64_t cur_token, int64_t start_pos) {
   // update input_tok
   *input_toks_.data =
       metadata_.use_int64_token ? cur_token : static_cast<int32_t>(cur_token);
   // update position_ids
   *input_pos_.data = static_cast<int32_t>(start_pos);
-  // update all_position_ids
   for (int i = 0; i < 3; i++) {
-    position_ids_.data[i] = all_position_ids[i * metadata_.context_len + start_pos];
+    position_ids_.data[i] = start_pos;
   }
 }
 
 template <typename T>
 Result<int64_t> TokenGenerator<T>::generate(
     std::vector<uint64_t> tokens,
-    std::vector<uint16_t> all_position_ids,
     int64_t start_pos,
     int32_t seq_len,
     std::function<void(const std::string&)> token_callback,
@@ -295,7 +293,7 @@ Result<int64_t> TokenGenerator<T>::generate(
   // Generate our tokens
   while (pos < seq_len - 1) {
     // Fill in the token and position data
-    prepare_io(cur_token, pos, all_position_ids);
+    prepare_io(cur_token, pos);
     // Only update data pointer of the cache to the tensor for SHIFT_POINTER
     // mode
     bool updated = kv_manager_->update_cache_tensor(

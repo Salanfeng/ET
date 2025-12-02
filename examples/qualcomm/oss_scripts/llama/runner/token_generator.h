@@ -72,7 +72,6 @@ class TokenGenerator {
      */
   virtual executorch::runtime::Result<int64_t> generate(
       std::vector<uint64_t> tokens,
-      std::vector<uint16_t> all_position_ids,
       int64_t start_pos,
       int32_t seq_len,
       std::function<void(const std::string&)> token_callback,
@@ -97,7 +96,7 @@ class TokenGenerator {
   // inputs and outputs
   TensorStruct<int64_t> input_toks_;
   TensorStruct<uint16_t> inputs_embeds_;
-  TensorStruct<uint16_t> position_ids_;
+  TensorStruct<int32_t> position_ids_;
   TensorStruct<int32_t> input_pos_;
   TensorStruct<uint16_t> attention_mask_;
   TensorStruct<uint16_t> window_attention_mask_;
@@ -126,7 +125,7 @@ class TokenGenerator {
    * @param cur_token Current token.
    * @param start_pos Starting position.
    */
-  void prepare_io(uint64_t cur_token, int64_t start_pos, const std::vector<uint16_t>& all_position_ids);
+  void prepare_io(uint64_t cur_token, int64_t start_pos);
 
   // metadata
   Metadata metadata_;

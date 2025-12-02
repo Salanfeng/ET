@@ -506,8 +506,8 @@ def kv_inference(  # noqa: C901
     
     if prompt.startswith("start"):
         is_vl_model = True
-        
-    _, atten_mask, _, position_ids, _, k_caches, v_caches = get_example_inputs(use_kv_cache=True)
+
+    _, atten_mask, _, _, _, k_caches, v_caches = get_example_inputs(use_kv_cache=True)
 
     # TODO: change criteria & support batch inputs if necessary
     all_pos = torch.arange(0, max_seq_len, 1, dtype=torch.int32).unsqueeze(0)

@@ -192,7 +192,6 @@ void LhdTokenGenerator<T>::update_lookahead_branch(
 template <typename T>
 Result<int64_t> LhdTokenGenerator<T>::generate(
     std::vector<uint64_t> tokens,
-    std::vector<uint16_t> all_position_ids,
     int64_t start_pos,
     int32_t seq_len,
     std::function<void(const std::string&)> token_callback,

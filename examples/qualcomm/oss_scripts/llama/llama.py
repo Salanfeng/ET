@@ -228,6 +228,14 @@ class SingleLlama:
         chat_template=None,
         lookahead_config=None,
     ):
+        # Check user's prompt, helps calibrate special token
+        prompt = (
+            args.prompt[0]
+            if chat_template is None
+            else apply_prompt_template(
+                chat_template, args.prompt[0], args.system_prompt
+            )
+        )
         graph_module_inference(
             use_kv_cache=self.llama_meta["get_use_kv_cache"],
             get_example_inputs=self.get_example_inputs,
@@ -237,10 +245,11 @@ class SingleLlama:
             ar_len=self.llama_meta["get_ar_len"],
             max_seq_len=self.llama_meta["get_max_seq_len"],
             kv_updater=args.kv_updater,
-            prompt="start",
+            prompt=prompt,
             num_fewshot=args.num_fewshot,
             use_i64_token=args.embedding_quantize is not None,
             event_name="testing",
+            is_vl_model=True,
         )
         self.quant_dtype = quant_dtype
         quantizer = make_custom_quantizer(
@@ -290,14 +299,7 @@ class SingleLlama:
                 seq_mse_candidates=self.decoder_model_config.seq_mse_candidates,
             )
 
-        # Check user's prompt, helps calibrate special token
-        prompt = (
-            args.prompt[0]
-            if chat_template is None
-            else apply_prompt_template(
-                chat_template, args.prompt[0], args.system_prompt
-            )
-        )
+
         graph_module_inference(
             use_kv_cache=self.llama_meta["get_use_kv_cache"],
             get_example_inputs=self.get_example_inputs,
