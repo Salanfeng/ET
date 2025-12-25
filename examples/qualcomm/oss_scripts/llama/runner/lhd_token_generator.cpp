@@ -20,7 +20,7 @@ void LhdTokenGenerator<T>::prepare_io(
   for (int i = 0; i < metadata_.ar_len; i++) {
     if (i < input_tokens.size()) {
       // Prepare pos data
-      this->input_pos_.data[i] = input_pos[i];
+      // this->input_pos_.data[i] = input_pos[i];
 
       // Support CPU 4-bit embedding, which requires int64 input.
       // However, for QNN embedding, only int32 input is needed.
@@ -192,6 +192,8 @@ void LhdTokenGenerator<T>::update_lookahead_branch(
 template <typename T>
 Result<int64_t> LhdTokenGenerator<T>::generate(
     std::vector<uint64_t> tokens,
+    std::vector<float> final_cos,
+    std::vector<float> final_sin,
     int64_t start_pos,
     int32_t seq_len,
     std::function<void(const std::string&)> token_callback,

@@ -24,7 +24,7 @@
 #include <pytorch/tokenizers/llama2c_tokenizer.h>
 #include <algorithm>
 #include <fstream>
-
+#include <iostream>
 using executorch::extension::Module;
 using executorch::extension::llm::get_rss_bytes;
 using executorch::extension::llm::print_report;
@@ -37,6 +37,170 @@ namespace llm = ::executorch::extension::llm;
 
 namespace example {
 namespace {
+
+size_t ggml_type_size(uint32_t type) {
+    switch (type) {
+        case GGML_TYPE_F32: return 4;
+        case GGML_TYPE_I32: return 4;
+        default: throw std::runtime_error("不支持的类型");
+    }
+}
+
+void parse_mtmd(const std::string& path,
+                 std::vector<float>& embeddings,
+                 std::vector<int32_t>& position_ids) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) throw std::runtime_error("无法打开文件");
+
+    mtmd_binary_header header;
+    file.read(reinterpret_cast<char*>(&header), sizeof(header));
+    
+    if (std::string(header.magic, 4) != "MTMD")
+        throw std::runtime_error("Magic number错误");
+
+    size_t embd_size = header.n_tokens * header.n_embd_dims * ggml_type_size(header.embd_type);
+    embeddings.resize(header.n_tokens * header.n_embd_dims);
+    file.read(reinterpret_cast<char*>(embeddings.data()), embd_size);
+
+    // 读取position数据
+    size_t pos_size = header.n_tokens * header.n_pos_dims * ggml_type_size(header.pos_type);
+    std::vector<int32_t> tmp_position_ids(header.n_tokens * header.n_pos_dims);
+    ET_LOG(Info, "Position IDs n_tokens: %d, n_pos_dims: %d", header.n_tokens, header.n_pos_dims);
+    position_ids.resize(header.n_tokens * header.n_pos_dims);
+    file.read(reinterpret_cast<char*>(tmp_position_ids.data()), pos_size);
+    for (size_t i = 0; i < tmp_position_ids.size(); ++i) {
+        position_ids[i] = tmp_position_ids[i];
+    }
+
+  
+    // 打印前10个token的样例
+    // ET_LOG(Info, "\nEmbeddings (前10个token的前8维):\n");
+    // for (int i = 0; i < std::min(10u, header.n_tokens); ++i) {
+    //     ET_LOG(Info, "Token %d: ", i);
+    //     for (int j = 0; j < std::min(16u, header.n_embd_dims); ++j) {
+    //         ET_LOG(Info, "%f ", embeddings[i * header.n_embd_dims + j]);
+    //     }
+    //     ET_LOG(Info, "...\n");
+    // }
+
+    // ET_LOG(Info, "\nPosition IDs:\n");
+    // for (int i = 0; i < std::min(3u, header.n_pos_dims); ++i) {
+    //     ET_LOG(Info, "Dimension: %d: ", i);
+    //     for (int j = 0; j < std::min(64u, header.n_tokens); ++j) {
+    //         ET_LOG(Info, "%d ", position_ids[i * header.n_tokens + j]);
+    //     }
+    //     ET_LOG(Info, "...\n");
+    // }
+    // ET_LOG(Info, (position_ids.size() > 10 ? "...\n" : "\n"));
+    file.close();
+}
+
+void precompute_freqs_cos_sin(
+    int max_seq_len,
+    int rotary_dim,        // 128
+    float theta,           // 1e6
+    std::vector<float>& freqs_cos_all,
+    std::vector<float>& freqs_sin_all
+) {
+    freqs_cos_all.resize(max_seq_len * rotary_dim / 2);
+    freqs_sin_all.resize(max_seq_len * rotary_dim / 2);
+
+    // 1. 计算 inv_freq[i] = theta ^ (-2i / rotary_dim)
+    std::vector<float> inv_freq(rotary_dim);
+    for (int i = 0; i < rotary_dim; ++i) {
+        inv_freq[i] = std::pow(theta, -2.0f * i / rotary_dim);
+    }
+
+    // 2. 对每个 position 计算 cos / sin
+    for (int pos = 0; pos < max_seq_len; ++pos) {
+        for (int i = 0; i < rotary_dim / 2; ++i) {
+            float angle = pos * inv_freq[i];
+            freqs_cos_all[pos * rotary_dim / 2 + i] = std::cos(angle);
+            freqs_sin_all[pos * rotary_dim / 2 + i] = std::sin(angle);
+        }
+    }
+
+    // //Debug: 输出sin的前10个位置的所有维度值
+    // ET_LOG(Info, "\nFreqs Sin (前10个位置):\n");
+    // for (int pos = 0; pos < std::min(10, max_seq_len); ++pos) {
+    //     ET_LOG(Info, "Position %d: ", pos);
+    //     for (int i = 0; i < rotary_dim / 2; ++i) {
+    //         ET_LOG(Info, "%f ", freqs_sin_all[pos * rotary_dim / 2 + i]);
+    //     }
+    //     ET_LOG(Info, "\n");
+    // }
+
+}
+
+void build_final_mrope_cos_sin(
+    const std::vector<float>& freqs_cos_all, // [max_seq, 64]
+    const std::vector<float>& freqs_sin_all, // [max_seq, 64]
+    int max_seq,
+    const std::vector<int32_t>& position_ids, // [3][n_tokens]
+    std::vector<float>& out_cos,               // [n_tokens][64]
+    std::vector<float>& out_sin
+) {
+    constexpr int rotary_dim = 64;
+    constexpr int mrope_section[3] = {16, 24, 24};
+    int n_tokens = position_ids.size() / 3;
+
+    out_cos.resize(max_seq * rotary_dim);
+    out_sin.resize(max_seq * rotary_dim);
+
+    int dst_offset = 0;
+    int src_offset = 0;
+
+    for (int s = 0; s < 3; ++s) {
+        int sec = mrope_section[s];
+
+        for (int t = 0; t < n_tokens; ++t) {
+            int pos = position_ids[s * n_tokens + t];
+
+            const float* src_cos =
+                &freqs_cos_all[pos * rotary_dim + src_offset];
+            const float* src_sin =
+                &freqs_sin_all[pos * rotary_dim + src_offset];
+
+            float* dst_cos =
+                &out_cos[t * rotary_dim + dst_offset];
+            float* dst_sin =
+                &out_sin[t * rotary_dim + dst_offset];
+
+            memcpy(dst_cos, src_cos, sec * sizeof(float));
+            memcpy(dst_sin, src_sin, sec * sizeof(float));
+        }
+
+        for (int pos = n_tokens; pos < max_seq; ++pos) {
+            const float* src_cos =
+                &freqs_cos_all[pos * rotary_dim + src_offset];
+            const float* src_sin =
+                &freqs_sin_all[pos * rotary_dim + src_offset];
+
+            float* dst_cos =
+                &out_cos[pos * rotary_dim + dst_offset];
+            float* dst_sin =
+                &out_sin[pos * rotary_dim + dst_offset];
+
+            memcpy(dst_cos, src_cos, sec * sizeof(float));
+            memcpy(dst_sin, src_sin, sec * sizeof(float));
+        }
+
+        src_offset += sec;
+        dst_offset += sec;
+    }
+
+    // // Debug: 输出final_sin的前30个token的所有维度值
+    // ET_LOG(Info, "\nFinal MRoPE Sin (前30个token):\n");
+    // for (int t = 0; t < std::min(30, n_tokens); ++t) {
+    //     ET_LOG(Info, "Token %d: ", t);
+    //     for (int i = 0; i < rotary_dim; ++i) {
+    //         ET_LOG(Info, "%f ", out_sin[t * rotary_dim + i]);
+    //     }
+    //     ET_LOG(Info, "\n");
+    // }
+}
+
+
 void print_performance_report(
     const Stats& stats,
     const std::string& performance_output_path) {
@@ -370,6 +534,11 @@ Error Runner<T>::generate_from_prompt_or_file(
     std::function<void(const Stats&)> stats_callback) {
 
   std::vector<uint16_t> input_embeds(0);
+  std::vector<int32_t> all_position_ids(0);
+  std::vector<float> freqs_cos_all;
+  std::vector<float> freqs_sin_all;
+  std::vector<float> final_cos;
+  std::vector<float> final_sin;
 
   ET_CHECK_MSG(!prompt.empty() || !input_embeds.empty(), "prompt cannot be null");
   if (!is_loaded()) {
@@ -405,40 +574,51 @@ Error Runner<T>::generate_from_prompt_or_file(
           prompt.c_str());
     }
   } else if (embeds) {
-      std::vector<float> input_embeds_tmp(0);
-      std::ifstream file(prompt, std::ios::binary);
-      if (!file.is_open()) {
-        ET_CHECK_MSG(false, "Failed to open %s", prompt.c_str());
-      } else {
-        file.seekg(0, std::ios::end);
-        size_t file_size = file.tellg();
-        file.seekg(0, std::ios::beg);
-        size_t num_elements = file_size / sizeof(float);
-        input_embeds_tmp.resize(num_elements);
-        file.read(reinterpret_cast<char*>(input_embeds_tmp.data()), input_embeds_tmp.size() * sizeof(float));
-        file.close();
+      std::vector<float> input_embeds_tmp;
 
-        // quantize input_embeds
-        double logits_scale_ = 1.0;
-        int64_t logits_zero_point_ = 0;
-        if (module_->method_names()->count("get_ie_logits_scale") > 0) {
-          logits_scale_ = module_->get("get_ie_logits_scale").get().toScalar().to<double>();
-        } else {
-          ET_CHECK_MSG(false, "get_ie_logits_scale method not found in the model");
-        }
-        if (module_->method_names()->count("get_ie_logits_zero_point") > 0) {
-          logits_zero_point_ = module_->get("get_ie_logits_zero_point").get().toScalar().to<int64_t>();
-        } else {
-          ET_CHECK_MSG(false, "get_ie_logits_zero_point method not found in the model");
-        }
-        ET_LOG(Info, "input_embeds quantization scale: %e zero point: %ld", logits_scale_, logits_zero_point_);
-        input_embeds.resize(input_embeds_tmp.size());
-        for (size_t i = 0; i < input_embeds_tmp.size(); i++) {
-          int32_t quantized_value = static_cast<int32_t>(
-              std::round(input_embeds_tmp[i] / logits_scale_) + logits_zero_point_);
-          quantized_value = std::max(0, std::min(65535, quantized_value));
-          input_embeds[i] = static_cast<uint16_t>(quantized_value);
-        }
+      parse_mtmd(prompt, input_embeds_tmp, all_position_ids);
+
+      precompute_freqs_cos_sin(
+          context_len_,
+          128,
+          1e6,
+          freqs_cos_all,
+          freqs_sin_all);
+
+      build_final_mrope_cos_sin(
+        freqs_cos_all,
+        freqs_sin_all,
+        seq_len,
+        all_position_ids,   // [3 * n_tokens]
+        final_cos,          // [seq_len * 64]
+        final_sin           // [seq_len * 64]
+      );
+
+
+      // quantize input_embeds
+      double logits_scale_ = 1.0;
+      int64_t logits_zero_point_ = 0;
+      if (module_->method_names()->count("get_ie_logits_scale") > 0) {
+        logits_scale_ = module_->get("get_ie_logits_scale").get().toScalar().to<double>();
+      } else {
+        ET_CHECK_MSG(false, "get_ie_logits_scale method not found in the model");
+      }
+      if (module_->method_names()->count("get_ie_logits_zero_point") > 0) {
+        logits_zero_point_ = module_->get("get_ie_logits_zero_point").get().toScalar().to<int64_t>();
+      } else {
+        ET_CHECK_MSG(false, "get_ie_logits_zero_point method not found in the model");
+      }
+      ET_LOG(Info, "input_embeds quantization scale: %e zero point: %ld", logits_scale_, logits_zero_point_);
+      input_embeds.resize(input_embeds_tmp.size());
+      for (size_t i = 0; i < input_embeds_tmp.size(); i++) {
+        int32_t quantized_value = static_cast<int32_t>(
+            std::round(input_embeds_tmp[i] / logits_scale_) + logits_zero_point_);
+        quantized_value = std::max(0, std::min(65535, quantized_value));
+        input_embeds[i] = static_cast<uint16_t>(quantized_value);
+        // 每行2048个，打印每行前10个
+        // if (i % 2048 < 10) {
+        //   ET_LOG(Info, "input_embeds[%ld]: %f -> %u", i, input_embeds_tmp[i], input_embeds[i]);
+        // }
       }
   } else {
     tokenizers::Result<std::vector<uint64_t>> encode_res =
@@ -459,7 +639,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   }
   bool dump_logits = dump_logits_path_.empty() ? false : true;
   auto prefill_res =
-      prompt_processor_->prefill(prompt_tokens, input_embeds, cur_pos_, dump_logits);
+      prompt_processor_->prefill(prompt_tokens, input_embeds, final_cos, final_sin, cur_pos_, dump_logits);
   ET_LOG(Info, "finished prompt prefill");
     
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
@@ -482,7 +662,7 @@ Error Runner<T>::generate_from_prompt_or_file(
   // start the main loop
   prompt_tokens.push_back(cur_token);
   int64_t num_generated_tokens = ET_UNWRAP(token_generator_->generate(
-      prompt_tokens, cur_pos_, seq_len, token_callback, dump_logits));
+      prompt_tokens, final_cos, final_sin, cur_pos_, seq_len, token_callback, dump_logits));
   stats_.inference_end_ms = time_in_ms();
   ET_LOG(
       Info,

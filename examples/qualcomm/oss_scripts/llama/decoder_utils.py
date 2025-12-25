@@ -20,6 +20,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
     EVAL_MODE,
 )
 from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import AttentionMask
+from executorch.examples.models.llama.rope import hf_precompute_freqs_cis
 
 from executorch.examples.qualcomm.utils import make_output_dir, SimpleADB
 from executorch.exir._serialize._program import deserialize_pte_binary
@@ -516,6 +517,14 @@ def kv_inference(  # noqa: C901
         prompt_token_list = prompt.flatten().tolist()
     total_token_list = prompt_token_list
     dtype = torch.int64 if use_i64_token else torch.int32
+    
+    freqs_cos, freqs_sin = hf_precompute_freqs_cis(
+        128, # qwen2.5 uses head_dim 128, todo: make it configurable if necessary
+        max_seq_len,
+        1e6
+    )
+    freqs_cos = freqs_cos[:, : freqs_cos.shape[-1] // 2]
+    freqs_sin = freqs_sin[:, : freqs_sin.shape[-1] // 2]
 
     with torch.no_grad():
         # Phase 1: Prefill the prompt in ar_len chunks.
@@ -535,7 +544,8 @@ def kv_inference(  # noqa: C901
             )
             
             inputs_embeds = tok_embeddings(tmp_token_list)
-
+            
+            freqs_cos_sin = torch.cat([freqs_cos[pos : pos + ar_len, :].unsqueeze(0), freqs_sin[pos : pos + ar_len, :].unsqueeze(0)], dim=0)
             # Prepare tmp_pos (padded with zeros).
             tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
             tmp_pos[0, :num_tokens_in_chunk] = all_pos[
@@ -548,7 +558,7 @@ def kv_inference(  # noqa: C901
                 tmp_token_list,
                 *atten_mask,
                 inputs_embeds,
-                tmp_pos,
+                freqs_cos_sin,
                 *k_caches,
                 *v_caches,
             )
@@ -600,7 +610,8 @@ def kv_inference(  # noqa: C901
                 )
                 
                 inputs_embeds = tok_embeddings(tmp_token_list)
-
+                
+                freqs_cos_sin = torch.cat([freqs_cos[chunk_start_idx : chunk_start_idx + ar_len, :].unsqueeze(0), freqs_sin[chunk_start_idx : chunk_start_idx + ar_len, :].unsqueeze(0)], dim=0)
                 # Prepare tmp_pos (padded with zeros).
                 tmp_pos = torch.zeros((1, ar_len), dtype=torch.int32)
                 tmp_pos[0, :num_tokens_in_chunk] = all_pos[
@@ -611,7 +622,7 @@ def kv_inference(  # noqa: C901
                     tmp_token_list,
                     *atten_mask,
                     inputs_embeds,
-                    tmp_pos,
+                    freqs_cos_sin,
                     *k_caches,
                     *v_caches,
                 )
@@ -725,7 +736,7 @@ def prefill_inference(
     use_i64_token=False,
     collect_logits=False,
 ):
-    _, atten_mask, _ = get_example_inputs(use_kv_cache=False)
+    _, atten_mask, _, _ = get_example_inputs(use_kv_cache=False)
 
     # TODO: change criteria & support batch inputs if necessary
 

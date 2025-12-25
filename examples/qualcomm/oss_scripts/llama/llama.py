@@ -143,7 +143,7 @@ class SingleLlama:
             inputs[0],  # tokens
             *inputs[1],  # attn_mask
             inputs[2],  # input_embeds
-            *((inputs[3],) if self.llama_meta["get_use_kv_cache"] else []),  # pos_ids
+            inputs[3],  # freqs_cos_sin
             *(inputs[4] if self.llama_meta["get_use_kv_cache"] else []),  # k_caches
             *(inputs[5] if self.llama_meta["get_use_kv_cache"] else []),  # v_caches
         )

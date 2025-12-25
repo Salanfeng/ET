@@ -532,20 +532,16 @@ class LlamaModel(nn.Module):
         tokens: torch.Tensor,
         atten_mask: torch.Tensor,
         inputs_embeds: torch.Tensor,
-        input_pos: Optional[torch.Tensor] = None,
+        freqs_cos_sin: torch.Tensor, # 2*ar_len, head_dim//2
         *args,
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
 
         output_k_cache = []
         output_v_cache = []
         # following tensors should be invariant across batches
-        freqs_cos = (
-            self.freqs_cos[input_pos][0] if self.use_kv_cache else self.freqs_cos
-        )
-        freqs_sin = (
-            self.freqs_sin[input_pos][0] if self.use_kv_cache else self.freqs_sin
-        )
 
+        freqs_cos = freqs_cos_sin[0]
+        freqs_sin = freqs_cos_sin[1]
         if self.use_embeds:
             hidden_states = inputs_embeds
         else:
@@ -583,6 +579,7 @@ class LlamaModel(nn.Module):
             self.vocab_size, (self.max_batch_size, self.ar_len), dtype=dtype
         )
         input_embeds = self.tok_embeddings(tokens)
+        freqs_cos_sin = (self.freqs_cos[: self.ar_len, :], self.freqs_sin[: self.ar_len, :])
         atten_mask = AttentionMask(
             CausalAttentionMask(self.max_batch_size, self.ar_len, self.max_seq_len)
         )
@@ -611,7 +608,7 @@ class LlamaModel(nn.Module):
                 tokens,
                 atten_mask,
                 input_embeds,
-                pos_ids,
+                freqs_cos_sin,
                 k_cache,
                 v_cache,
             )
@@ -620,6 +617,7 @@ class LlamaModel(nn.Module):
             tokens,
             atten_mask,
             input_embeds,
+            freqs_cos_sin,
         )
 
     def get_metadata(self):

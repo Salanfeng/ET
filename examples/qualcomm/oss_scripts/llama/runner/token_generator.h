@@ -72,16 +72,18 @@ class TokenGenerator {
      */
   virtual executorch::runtime::Result<int64_t> generate(
       std::vector<uint64_t> tokens,
+      std::vector<float> freqs_cos,
+      std::vector<float> freqs_sin,
       int64_t start_pos,
       int32_t seq_len,
       std::function<void(const std::string&)> token_callback,
       bool dump_logits);
   inline const size_t total_token_generator_io_size_in_bytes() const {
     if (metadata_.cache_mode == CacheMode::HybridCache) {
-      return input_toks_.size + inputs_embeds_.size + input_pos_.size + attention_mask_.size +
+      return input_toks_.size + inputs_embeds_.size + freqs_cos_sin0_.size + freqs_cos_sin1_.size + attention_mask_.size +
           window_attention_mask_.size + logits_.size;
     } else {
-      return input_toks_.size + inputs_embeds_.size + input_pos_.size + attention_mask_.size +
+      return input_toks_.size + inputs_embeds_.size + freqs_cos_sin0_.size + freqs_cos_sin1_.size + attention_mask_.size +
           logits_.size;
     }
   }
@@ -96,7 +98,8 @@ class TokenGenerator {
   // inputs and outputs
   TensorStruct<int64_t> input_toks_;
   TensorStruct<uint16_t> inputs_embeds_;
-  TensorStruct<int32_t> input_pos_;
+  TensorStruct<float> freqs_cos_sin0_;
+  TensorStruct<float> freqs_cos_sin1_;
   TensorStruct<uint16_t> attention_mask_;
   TensorStruct<uint16_t> window_attention_mask_;
   TensorStruct<uint16_t> logits_;
@@ -124,7 +127,7 @@ class TokenGenerator {
    * @param cur_token Current token.
    * @param start_pos Starting position.
    */
-  void prepare_io(uint64_t cur_token, int64_t start_pos);
+  void prepare_io(uint64_t cur_token,const std::vector<float>& freqs_cos, const std::vector<float>& freqs_sin, int64_t start_pos);
 
   // metadata
   Metadata metadata_;

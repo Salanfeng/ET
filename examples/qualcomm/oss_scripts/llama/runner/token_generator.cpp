@@ -38,7 +38,8 @@ TokenGenerator<T>::TokenGenerator(
   // Calculate I/O size
   input_toks_.size = metadata_.ar_len * sizeof(int64_t);
   inputs_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
-  input_pos_.size = metadata_.ar_len * sizeof(int32_t);
+  freqs_cos_sin0_.size = metadata_.ar_len * 64 * sizeof(float);
+  freqs_cos_sin1_.size = metadata_.ar_len * 64 * sizeof(float);
   attention_mask_.size =
       metadata_.ar_len * metadata_.context_len * sizeof(uint16_t);
 
@@ -110,6 +111,34 @@ void TokenGenerator<T>::init_io(
   input_tensors_.emplace_back(inputs_embeds_.tensor.get());
   buffer_manager->add_memory_info(
       inputs_embeds_.data, inputs_embeds_.size, inputs_embeds.get());
+    
+  // [I]: freqs_cos_sin0
+    Result<TensorInfo> freqs_cos_sin0 = method_meta->input_tensor_meta(idx++);
+    freqs_cos_sin0_.data = reinterpret_cast<float*>(
+        buffer_manager->allocate(freqs_cos_sin0_.size));
+    freqs_cos_sin0_.tensor = std::make_unique<TensorImpl>(
+        freqs_cos_sin0->scalar_type(),
+        freqs_cos_sin0->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(freqs_cos_sin0->sizes().data()),
+        freqs_cos_sin0_.data,
+        const_cast<TensorImpl::DimOrderType*>(freqs_cos_sin0->dim_order().data()));
+    input_tensors_.emplace_back(freqs_cos_sin0_.tensor.get());
+    buffer_manager->add_memory_info(
+        freqs_cos_sin0_.data, freqs_cos_sin0_.size, freqs_cos_sin0.get());
+
+  // [I]: freqs_cos_sin1
+    Result<TensorInfo> freqs_cos_sin1 = method_meta->input_tensor_meta(idx++);
+    freqs_cos_sin1_.data = reinterpret_cast<float*>(
+        buffer_manager->allocate(freqs_cos_sin1_.size));
+    freqs_cos_sin1_.tensor = std::make_unique<TensorImpl>(
+        freqs_cos_sin1->scalar_type(),
+        freqs_cos_sin1->sizes().size(),
+        const_cast<TensorImpl::SizesType*>(freqs_cos_sin1->sizes().data()),
+        freqs_cos_sin1_.data,
+        const_cast<TensorImpl::DimOrderType*>(freqs_cos_sin1->dim_order().data()));
+    input_tensors_.emplace_back(freqs_cos_sin1_.tensor.get());
+    buffer_manager->add_memory_info(
+        freqs_cos_sin1_.data, freqs_cos_sin1_.size, freqs_cos_sin1.get());
 
   // [I]: sliding window attention_mask
   if (metadata_.cache_mode == CacheMode::HybridCache) {
@@ -132,19 +161,6 @@ void TokenGenerator<T>::init_io(
         window_attention_mask.get());
   }
 
-  // [I]: input_pos
-  Result<TensorInfo> input_pos = method_meta->input_tensor_meta(idx++);
-  input_pos_.data =
-      reinterpret_cast<int32_t*>(buffer_manager->allocate(input_pos_.size));
-  input_pos_.tensor = std::make_unique<TensorImpl>(
-      input_pos->scalar_type(),
-      input_pos->sizes().size(),
-      const_cast<TensorImpl::SizesType*>(input_pos->sizes().data()),
-      input_pos_.data,
-      const_cast<TensorImpl::DimOrderType*>(input_pos->dim_order().data()));
-  input_tensors_.emplace_back(input_pos_.tensor.get());
-  buffer_manager->add_memory_info(
-      input_pos_.data, input_pos_.size, input_pos.get());
 
   // [I] kv_cache
   size_t index = idx; // bypass input_tokens, atten_mask, inputs_embeds, input_pos
@@ -226,17 +242,28 @@ const std::vector<uint16_t>& TokenGenerator<T>::get_all_logits() {
 
 // This function only considers the case where token_generator_ar_len equals 1.
 template <typename T>
-void TokenGenerator<T>::prepare_io(uint64_t cur_token, int64_t start_pos) {
+void TokenGenerator<T>::prepare_io(uint64_t cur_token, const std::vector<float>& freqs_cos, const std::vector<float>& freqs_sin, int64_t start_pos) {
   // update input_tok
   *input_toks_.data =
       metadata_.use_int64_token ? cur_token : static_cast<int32_t>(cur_token);
   // update position_ids
-  *input_pos_.data = static_cast<int32_t>(start_pos);
+//   *input_pos_.data = static_cast<int32_t>(start_pos);
+  // update freqs_cos_sin
+  std::memcpy(
+      freqs_cos_sin0_.data,
+      freqs_cos.data() + start_pos * 64,
+      64 * sizeof(float));
+  std::memcpy(
+      freqs_cos_sin1_.data,
+      freqs_sin.data() + start_pos * 64,
+      64 * sizeof(float));
 }
 
 template <typename T>
 Result<int64_t> TokenGenerator<T>::generate(
     std::vector<uint64_t> tokens,
+    std::vector<float> freqs_cos,
+    std::vector<float> freqs_sin,
     int64_t start_pos,
     int32_t seq_len,
     std::function<void(const std::string&)> token_callback,
@@ -275,7 +302,8 @@ Result<int64_t> TokenGenerator<T>::generate(
   // Generate our tokens
   while (pos < seq_len - 1) {
     // Fill in the token and position data
-    prepare_io(cur_token, pos);
+
+    prepare_io(cur_token, freqs_cos, freqs_sin, pos);
     // Only update data pointer of the cache to the tensor for SHIFT_POINTER
     // mode
     bool updated = kv_manager_->update_cache_tensor(

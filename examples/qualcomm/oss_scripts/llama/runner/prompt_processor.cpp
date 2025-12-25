@@ -32,10 +32,9 @@ PromptProcessor<T>::PromptProcessor(
   // Calculate I/O size
   input_toks_.size = metadata_.ar_len * sizeof(int64_t);
   inputs_embeds_.size = metadata_.ar_len * metadata_.hidden_size * sizeof(uint16_t);
-  if (is_bert())
-    input_pos_.size = 0;
-  else
-    input_pos_.size = metadata_.ar_len * sizeof(int32_t);
+  freqs_cos_sin0_.size = metadata_.ar_len * 64 * sizeof(float); // head_dim is 128 , todo: make it configurable if necessary
+  freqs_cos_sin1_.size = metadata_.ar_len * 64 * sizeof(float);
+
 
   switch (metadata_.cache_mode) {
     case CacheMode::StaticCahce:
@@ -106,6 +105,36 @@ void PromptProcessor<T>::init_io(
   buffer_manager->add_memory_info(
       inputs_embeds_.data, inputs_embeds_.size, inputs_embeds.get());
 
+  // [I]: freqs_cos
+  Result<TensorInfo> freqs_cos_sin0 = method_meta->input_tensor_meta(idx++);
+  freqs_cos_sin0_.data = reinterpret_cast<float*>(
+      buffer_manager->allocate(freqs_cos_sin0_.size));
+  freqs_cos_sin0_.tensor = std::make_unique<TensorImpl>(
+      freqs_cos_sin0->scalar_type(),
+      freqs_cos_sin0->sizes().size(),
+      const_cast<TensorImpl::SizesType*>(freqs_cos_sin0->sizes().data()),
+      freqs_cos_sin0_.data,
+      const_cast<TensorImpl::DimOrderType*>(
+          freqs_cos_sin0->dim_order().data()));
+  input_tensors_.emplace_back(freqs_cos_sin0_.tensor.get());
+  buffer_manager->add_memory_info(
+      freqs_cos_sin0_.data, freqs_cos_sin0_.size, freqs_cos_sin0.get());
+
+  // [I]: freqs_sin
+  Result<TensorInfo> freqs_cos_sin1 = method_meta->input_tensor_meta(idx++);
+  freqs_cos_sin1_.data = reinterpret_cast<float*>(
+      buffer_manager->allocate(freqs_cos_sin1_.size));
+  freqs_cos_sin1_.tensor = std::make_unique<TensorImpl>(
+      freqs_cos_sin1->scalar_type(),
+      freqs_cos_sin1->sizes().size(),
+      const_cast<TensorImpl::SizesType*>(freqs_cos_sin1->sizes().data()),
+      freqs_cos_sin1_.data,
+      const_cast<TensorImpl::DimOrderType*>(
+          freqs_cos_sin1->dim_order().data()));
+  input_tensors_.emplace_back(freqs_cos_sin1_.tensor.get());
+  buffer_manager->add_memory_info(
+      freqs_cos_sin1_.data, freqs_cos_sin1_.size, freqs_cos_sin1.get());
+
   // [I]: sliding window attention_mask
   if (metadata_.cache_mode == CacheMode::HybridCache) {
     Result<TensorInfo> window_attention_mask =
@@ -128,19 +157,6 @@ void PromptProcessor<T>::init_io(
   }
 
   if (!is_bert()) {
-    // [I]: input_pos
-    Result<TensorInfo> input_pos = method_meta->input_tensor_meta(idx++);
-    input_pos_.data =
-        reinterpret_cast<int32_t*>(buffer_manager->allocate(input_pos_.size));
-    input_pos_.tensor = std::make_unique<TensorImpl>(
-        input_pos->scalar_type(),
-        input_pos->sizes().size(),
-        const_cast<TensorImpl::SizesType*>(input_pos->sizes().data()),
-        input_pos_.data,
-        const_cast<TensorImpl::DimOrderType*>(input_pos->dim_order().data()));
-    input_tensors_.emplace_back(input_pos_.tensor.get());
-    buffer_manager->add_memory_info(
-        input_pos_.data, input_pos_.size, input_pos.get());
 
     // [I] kv_cache
     size_t index = idx; // bypass input_tokens, atten_mask, inputs_embeds, input_pos
@@ -225,13 +241,11 @@ template <typename T>
 void PromptProcessor<T>::prepare_io(
     const std::vector<uint64_t>& prompt_tokens,
     const std::vector<uint16_t>& inputs_embeds,
+    const std::vector<float>& freqs_cos,
+    const std::vector<float>& freqs_sin,
     int64_t prompt_pos,
     int64_t start_pos) {
   for (int i = 0; i < metadata_.ar_len; i++) {
-    if (!is_bert()) {
-      // Prepare pos data
-      input_pos_.data[i] = start_pos + i;
-    }
 
     // Prepare input token data
     if (prompt_pos + i < prompt_tokens.size()) {
@@ -253,12 +267,23 @@ void PromptProcessor<T>::prepare_io(
           metadata_.hidden_size * sizeof(uint16_t));
     }
   }
+  // Prepare freqs_cos_sin data
+  std::memcpy(
+      freqs_cos_sin0_.data,
+      freqs_cos.data() + start_pos * 64,
+      metadata_.ar_len * 64 * sizeof(float));
+  std::memcpy(
+      freqs_cos_sin1_.data,
+      freqs_sin.data() + start_pos * 64,
+      metadata_.ar_len * 64 * sizeof(float));
 }
 
 template <typename T>
 Result<uint64_t> PromptProcessor<T>::prefill(
     std::vector<uint64_t> prompt_tokens,
     std::vector<uint16_t> inputs_embeds,
+    std::vector<float> freqs_cos,
+    std::vector<float> freqs_sin,
     int64_t start_pos,
     bool dump_logits) {
   ET_CHECK_MSG(!prompt_tokens.empty() || !inputs_embeds.empty(), "Prompt cannot be null");
@@ -318,7 +343,7 @@ Result<uint64_t> PromptProcessor<T>::prefill(
       method_name_.c_str());
   for (int i = 0; i < num_iters; ++i) {
     // Fill in the token and position data
-    prepare_io(prompt_tokens, inputs_embeds, prompt_pos, pos);
+    prepare_io(prompt_tokens, inputs_embeds, freqs_cos, freqs_sin, prompt_pos, pos);
     // Only update data pointer of the cache to the tensor for SHIFT_POINTER
     // mode
     bool updated = kv_manager_->update_cache_tensor(
